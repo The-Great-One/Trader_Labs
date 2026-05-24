@@ -36,3 +36,33 @@ Do not edit live trading rules directly from labs. Promotion requires:
 4. A small, reviewed patch/PR/cherry-pick into Auto_Trader.
 
 See `PROMOTION.md`.
+
+## Lab-only Kite data refresh
+
+Trader_Labs can refresh Kite auth/history without using the live Auto_Trader
+trading service session.
+
+1. Create ignored credentials:
+
+```bash
+cp secrets/kite_lab_secrets.example.py secrets/kite_lab_secrets.py
+# fill API_KEY, API_SECRET, USER_NAME, PASS, TOTP_KEY
+```
+
+2. Generate a lab-only token:
+
+```bash
+python scripts/kite_lab_token.py refresh --browser
+python scripts/kite_lab_token.py check
+```
+
+3. Fetch historical OHLCV into the lab cache:
+
+```bash
+python scripts/kite_lab_fetch_history.py --universe NIFTY200 --interval day --years 5
+# or preview first
+python scripts/kite_lab_fetch_history.py --symbols RELIANCE,TCS,INFY --dry-run
+```
+
+Token and fetched data are written under `intermediary_files/`, which is ignored
+and should remain separate from live trading service state.

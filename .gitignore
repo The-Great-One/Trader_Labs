@@ -24,3 +24,11 @@ intermediary_files
 kronos_finetune/data/*.csv
 kronos_finetune/data/*.json
 kronos_finetune/finetuned/
+
+# Local Kite lab credentials/tokens
+secrets/*
+!secrets/kite_lab_secrets.example.py
+intermediary_files/kite_lab_access_token.json
+intermediary_files/kite_lab_instruments_cache.json
+intermediary_files/kite_lab_fetched_history.json
+intermediary_files/kite_lab_playwright_profile/
