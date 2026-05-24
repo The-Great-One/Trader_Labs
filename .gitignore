@@ -17,3 +17,6 @@ intermediary_files/
 .learnings/
 .env
 *.env
+
+external
+intermediary_files
