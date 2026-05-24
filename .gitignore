@@ -20,3 +20,7 @@ intermediary_files/
 
 external
 intermediary_files
+
+kronos_finetune/data/*.csv
+kronos_finetune/data/*.json
+kronos_finetune/finetuned/
