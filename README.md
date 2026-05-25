@@ -47,6 +47,16 @@ python scripts/qlib_paper_overlay.py --model sklearn_hgb --top-n 10
 
 It writes `reports/qlib_paper_overlay_latest.json`, marks the decision as
 `OBSERVE_ONLY`, and explicitly sets `production_action=NO_LIVE_TRADES`.
+
+Track Qlib picks against live-rule parity diagnostics with:
+
+```bash
+python scripts/qlib_rs_daily_tracker.py --top-n 10
+```
+
+This writes `reports/qlib_rs_daily_tracker_latest.json` and appends to
+`reports/qlib_rs_daily_tracker_history.jsonl`. It evaluates RS7 entry readiness
+and RS2 exit-if-held status for each Qlib pick, but still places no orders.
 Native `pyqlib` is optional in `requirements-research.txt`; this bridge is kept
 lightweight with sklearn/lightgbm fallbacks so it can run on the research hosts
 before any heavier dependency is promoted.
