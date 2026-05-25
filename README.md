@@ -61,6 +61,19 @@ Native `pyqlib` is optional in `requirements-research.txt`; this bridge is kept
 lightweight with sklearn/lightgbm fallbacks so it can run on the research hosts
 before any heavier dependency is promoted.
 
+## US fundamentals + news recommender
+
+Run a research-only US-market recommender for Tickertape-style US investing:
+
+```bash
+python scripts/us_fundamental_news_recommender.py
+```
+
+Universe: `data/us_markets/tickertape_us_universe.csv`.
+Output: `reports/us_fundamental_news_recommender_latest.json` and `.md`.
+The engine scores only fundamentals, ETF structure metrics, and recent news tone;
+it intentionally excludes technical indicators, price momentum, and live orders.
+
 ## Promotion rule
 
 Do not edit live trading rules directly from labs. Promotion requires:
