@@ -28,12 +28,15 @@ ROOT = Path(__file__).resolve().parents[1]
 os.environ.setdefault("AT_STATE_DIR", str(ROOT / "reports" / "qlib_rs_tracker_state"))
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
+from scripts import qlib_paper_overlay
 
 AUTOTRADER_ROOT = Path(os.getenv("AUTOTRADER_ROOT", str(ROOT.parent / "Stocks"))).expanduser()
-if str(AUTOTRADER_ROOT) not in sys.path:
-    sys.path.insert(0, str(AUTOTRADER_ROOT))
+# Put the live Auto_Trader repo before Trader_Labs so `Auto_Trader.*` resolves
+# to the full runtime package, not Trader_Labs' lightweight research stubs.
+if str(AUTOTRADER_ROOT) in sys.path:
+    sys.path.remove(str(AUTOTRADER_ROOT))
+sys.path.insert(0, str(AUTOTRADER_ROOT))
 
-from scripts import qlib_paper_overlay
 from Auto_Trader import RULE_SET_2, RULE_SET_7
 from Auto_Trader import utils as at_utils
 
