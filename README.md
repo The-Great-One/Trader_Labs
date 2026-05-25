@@ -3,9 +3,10 @@
 Research and validation workspace for Auto_Trader.
 
 This repository contains lab-only strategy research, walk-forward validation,
-Kronos experiments, option research, OOS/CAGR hunts, and Telegram/channel
-learning analysis. The live Auto_Trader repo remains focused on runtime,
-execution, paper shadowing, dashboards, and operational reports.
+Kronos experiments, Qlib-style alpha/ranking experiments, option research,
+OOS/CAGR hunts, and Telegram/channel learning analysis. The live Auto_Trader repo
+remains focused on runtime, execution, paper shadowing, dashboards, and
+operational reports.
 
 ## Relationship to Auto_Trader
 
@@ -25,6 +26,21 @@ pip install -r ../Stocks/requirements.txt
 pip install -r requirements-research.txt
 pip install -r requirements-kronos.txt  # optional, for Kronos
 ```
+
+## Qlib-style alpha lab
+
+Run a research-only Microsoft Qlib-style ranking experiment on Kite OHLCV cache:
+
+```bash
+python scripts/qlib_alpha_lab.py --model lightgbm --top-n 10,20,30 --rebalance W-FRI,ME
+```
+
+The lab uses point-in-time features, embargoed walk-forward scoring, and a
+transaction-cost-adjusted top-N rotation backtest. It writes
+`reports/qlib_alpha_lab_latest.json` and never edits live Auto_Trader rules.
+Native `pyqlib` is optional in `requirements-research.txt`; this bridge is kept
+lightweight with sklearn/lightgbm fallbacks so it can run on the research hosts
+before any heavier dependency is promoted.
 
 ## Promotion rule
 

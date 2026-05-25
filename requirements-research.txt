@@ -6,6 +6,10 @@ quantstats==0.0.81
 empyrical-reloaded==0.5.12
 ffn==1.1.5
 alphalens-reloaded==0.4.6
+# Optional for native Microsoft Qlib experiments. The first production-safe
+# bridge is scripts/qlib_alpha_lab.py, which has a sklearn/lightgbm fallback and
+# does not require pyqlib to run.
+pyqlib>=0.9.6
 arch==8.0.0
 pyod==3.2.1
 stumpy>=1.14.0
