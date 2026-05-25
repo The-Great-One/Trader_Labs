@@ -14,6 +14,7 @@ import math
 import os
 import re
 import sys
+import time
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -29,6 +30,7 @@ except Exception:  # pragma: no cover
 ROOT = Path(__file__).resolve().parents[1]
 OUT_DIR = ROOT / "reports"
 DEFAULT_UNIVERSE = ROOT / "data" / "us_markets" / "tickertape_us_universe.csv"
+CACHE_DIR = ROOT / "reports" / "us_recommender_cache"
 
 POSITIVE_WORDS = {
     "beat", "beats", "upgrade", "upgraded", "outperform", "growth", "surge", "surges", "record",
@@ -105,18 +107,57 @@ def load_universe(path: Path, limit: int | None = None) -> list[dict[str, str]]:
     return rows[:limit] if limit else rows
 
 
-def fetch_yahoo(symbol: str) -> tuple[dict[str, Any], list[dict[str, Any]], str]:
+def _cache_path(symbol: str) -> Path:
+    safe = re.sub(r"[^A-Za-z0-9_.-]", "_", symbol.upper())
+    return CACHE_DIR / f"{safe}.json"
+
+
+def _read_cache(symbol: str, max_age_hours: float) -> tuple[dict[str, Any], list[dict[str, Any]], str] | None:
+    path = _cache_path(symbol)
+    if not path.exists():
+        return None
+    try:
+        payload = json.loads(path.read_text())
+        fetched_at = datetime.fromisoformat(payload.get("fetched_at"))
+        age_h = (datetime.now(timezone.utc).astimezone() - fetched_at).total_seconds() / 3600.0
+        if age_h <= max_age_hours:
+            return payload.get("info") or {}, payload.get("news") or [], "ok_cache"
+    except Exception:
+        return None
+    return None
+
+
+def _write_cache(symbol: str, info: dict[str, Any], news: list[dict[str, Any]]) -> None:
+    try:
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        payload = {"fetched_at": now_iso(), "info": info, "news": news[:20]}
+        _cache_path(symbol).write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def fetch_yahoo(symbol: str, *, sleep_seconds: float, cache_hours: float) -> tuple[dict[str, Any], list[dict[str, Any]], str]:
+    cached = _read_cache(symbol, cache_hours)
+    if cached is not None:
+        return cached
     if yf is None:
         return {}, [], "yfinance_unavailable"
     try:
+        if sleep_seconds > 0:
+            time.sleep(sleep_seconds)
         ticker = yf.Ticker(symbol)
         info = ticker.get_info() or {}
         try:
             news = ticker.news or []
         except Exception:
             news = []
+        _write_cache(symbol, info, news)
         return info, news, "ok"
     except Exception as exc:
+        stale = _read_cache(symbol, max_age_hours=24 * 30)
+        if stale is not None:
+            info, news, _ = stale
+            return info, news, f"stale_cache_after_fetch_error:{str(exc)[:80]}"
         return {}, [], f"fetch_error:{str(exc)[:120]}"
 
 
@@ -211,7 +252,7 @@ def etf_scores(info: dict[str, Any]) -> dict[str, float]:
 
 
 def recommendation_label(score: float, risk_score: float, data_quality: str) -> str:
-    if data_quality != "ok":
+    if data_quality not in {"ok", "ok_cache"}:
         return "WATCH_DATA_GAP"
     if score >= 72 and risk_score <= 60:
         return "BUY_CANDIDATE"
@@ -222,10 +263,10 @@ def recommendation_label(score: float, risk_score: float, data_quality: str) -> 
     return "AVOID_FOR_NOW"
 
 
-def evaluate(row: dict[str, str]) -> Recommendation:
+def evaluate(row: dict[str, str], *, sleep_seconds: float, cache_hours: float) -> Recommendation:
     symbol = row["symbol"].upper()
     asset_class = (row.get("asset_class") or "STOCK").upper()
-    info, news, fetch_status = fetch_yahoo(symbol)
+    info, news, fetch_status = fetch_yahoo(symbol, sleep_seconds=sleep_seconds, cache_hours=cache_hours)
     nscore, headlines, news_hits = score_news(news)
     scores = etf_scores(info) if asset_class == "ETF" else stock_scores(info)
     total = scores["fundamental"] * 0.72 + nscore * 0.28
@@ -251,7 +292,7 @@ def evaluate(row: dict[str, str]) -> Recommendation:
         warnings.append("valuation_or_expense_ratio_unattractive")
     if nscore < 40:
         warnings.append("negative_recent_news_tone")
-    if data_quality != "ok":
+    if data_quality not in {"ok", "ok_cache"}:
         warnings.append(data_quality)
 
     metric_keys = [
@@ -308,6 +349,8 @@ def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="US fundamentals/news-only recommender")
     p.add_argument("--universe", default=str(DEFAULT_UNIVERSE))
     p.add_argument("--limit", type=int, default=int(os.getenv("AT_US_RECOMMENDER_LIMIT", "0") or "0"))
+    p.add_argument("--sleep-seconds", type=float, default=float(os.getenv("AT_US_RECOMMENDER_SLEEP_SECONDS", "1.0") or "1.0"))
+    p.add_argument("--cache-hours", type=float, default=float(os.getenv("AT_US_RECOMMENDER_CACHE_HOURS", "24") or "24"))
     return p
 
 
@@ -315,8 +358,8 @@ def main() -> int:
     args = build_parser().parse_args()
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     rows = load_universe(Path(args.universe), args.limit or None)
-    results = [asdict(evaluate(r)) for r in rows]
-    ranked = sorted(results, key=lambda x: (x["data_quality"] == "ok", x["total_score"]), reverse=True)
+    results = [asdict(evaluate(r, sleep_seconds=args.sleep_seconds, cache_hours=args.cache_hours)) for r in rows]
+    ranked = sorted(results, key=lambda x: (x["data_quality"] in {"ok", "ok_cache"}, x["total_score"]), reverse=True)
     payload = {
         "generated_at": now_iso(),
         "engine": "us_fundamental_news_recommender",
