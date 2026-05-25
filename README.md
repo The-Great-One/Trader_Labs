@@ -38,6 +38,15 @@ python scripts/qlib_alpha_lab.py --model lightgbm --top-n 10,20,30 --rebalance W
 The lab uses point-in-time features, embargoed walk-forward scoring, and a
 transaction-cost-adjusted top-N rotation backtest. It writes
 `reports/qlib_alpha_lab_latest.json` and never edits live Auto_Trader rules.
+
+Run the latest paper-only overlay signal report with:
+
+```bash
+python scripts/qlib_paper_overlay.py --model sklearn_hgb --top-n 10
+```
+
+It writes `reports/qlib_paper_overlay_latest.json`, marks the decision as
+`OBSERVE_ONLY`, and explicitly sets `production_action=NO_LIVE_TRADES`.
 Native `pyqlib` is optional in `requirements-research.txt`; this bridge is kept
 lightweight with sklearn/lightgbm fallbacks so it can run on the research hosts
 before any heavier dependency is promoted.
