@@ -30,7 +30,19 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 from scripts import qlib_paper_overlay
 
-AUTOTRADER_ROOT = Path(os.getenv("AUTOTRADER_ROOT", str(ROOT.parent / "Stocks"))).expanduser()
+def resolve_autotrader_root() -> Path:
+    candidates = []
+    env_root = os.getenv("AUTOTRADER_ROOT")
+    if env_root:
+        candidates.append(Path(env_root).expanduser())
+    candidates.extend([ROOT.parent / "Stocks", Path.home() / "Auto_Trader", ROOT.parent / "Auto_Trader"])
+    for cand in candidates:
+        if (cand / "Auto_Trader" / "RULE_SET_7.py").exists():
+            return cand
+    return candidates[0]
+
+
+AUTOTRADER_ROOT = resolve_autotrader_root()
 # Put the live Auto_Trader repo before Trader_Labs so `Auto_Trader.*` resolves
 # to the full runtime package, not Trader_Labs' lightweight research stubs.
 if str(AUTOTRADER_ROOT) in sys.path:
