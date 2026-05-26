@@ -48,6 +48,7 @@ class RotationResult:
     avg_positions: float
     total_return_pct: float
     cagr_pct: float
+    xirr_pct: float
     max_drawdown_pct: float
     vol_pct: float
     sharpe_like: float
@@ -200,6 +201,13 @@ def metrics(name: str, returns: pd.Series, weights: pd.DataFrame, turnover: pd.S
     eq = (1 + r).cumprod()
     years = len(r) / 252
     cagr = eq.iloc[-1] ** (1 / years) - 1 if years > 0 else np.nan
+    # Investor XIRR/CAGR should include cash/out-of-market days after the first
+    # active allocation. Keep active-only CAGR for strategy selection continuity,
+    # but report xirr_pct on the elapsed investor calendar.
+    elapsed = returns.loc[r.index[0] : returns.index[-1]].copy()
+    elapsed_eq = (1 + elapsed).cumprod()
+    elapsed_years = len(elapsed) / 252
+    xirr = elapsed_eq.iloc[-1] ** (1 / elapsed_years) - 1 if elapsed_years > 0 else np.nan
     dd = eq / eq.cummax() - 1
     vol = r.std() * math.sqrt(252)
     sharpe = (r.mean() * 252) / vol if vol and not np.isnan(vol) else np.nan
@@ -221,6 +229,7 @@ def metrics(name: str, returns: pd.Series, weights: pd.DataFrame, turnover: pd.S
         avg_positions=round(float(avg_positions), 2),
         total_return_pct=round((eq.iloc[-1] - 1) * 100, 2),
         cagr_pct=round(cagr * 100, 2),
+        xirr_pct=round(xirr * 100, 2),
         max_drawdown_pct=round(dd.min() * 100, 2),
         vol_pct=round(vol * 100, 2),
         sharpe_like=round(float(sharpe), 3) if not np.isnan(sharpe) else 0.0,
@@ -384,7 +393,7 @@ def main() -> int:
         },
         "baseline": asdict(baseline),
         "best": asdict(best),
-        "verdict": "research_candidate" if best.cagr_pct >= 30 and best.positive_years >= max(2, best.total_years - 1) else "needs_more_validation",
+        "verdict": "research_candidate" if best.xirr_pct >= 30 and best.positive_years >= max(2, best.total_years - 1) else "needs_more_validation",
         "promotion_note": "Do not promote from this report alone; run survivorship-controlled walk-forward and compare against live RS7/RS2 baseline.",
         "diagnostics_for_best": diagnostics.get(best.name, {}),
     }
