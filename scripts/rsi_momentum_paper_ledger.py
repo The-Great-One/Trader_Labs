@@ -11,9 +11,11 @@ Output: reports/paper_ledger_rsi_momentum_latest.json
 
 from __future__ import annotations
 
+import asyncio
 import json
 import math
 import os
+import socket
 import sys
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta
@@ -38,6 +40,7 @@ PAPER_SHADOW_FILE = OUT_DIR / "paper_shadow_rsi_momentum_latest.json"
 STATE_FILE = OUT_DIR / "paper_ledger_rsi_momentum_state.json"
 OUTPUT_FILE = OUT_DIR / "paper_ledger_rsi_momentum_latest.json"
 LIVE_PRICE_MAX_AGE_SEC = float(os.getenv("RSI_LEDGER_LIVE_MAX_AGE_SEC", "600"))
+TELEGRAM_ALERTS = os.getenv("RSI_LEDGER_TELEGRAM_ALERTS", "1").strip().lower() not in {"0", "false", "no", "off"}
 
 
 # ── Data loading ──────────────────────────────────────────────
@@ -112,6 +115,70 @@ def load_state() -> PortfolioState:
 def save_state(state: PortfolioState) -> None:
     state.updated_at = datetime.now().isoformat()
     STATE_FILE.write_text(json.dumps(state.to_dict(), indent=2), encoding="utf-8")
+
+
+def _format_money(value: float) -> str:
+    return f"₹{value:,.0f}"
+
+
+def _format_trade_line(trade: dict) -> str:
+    symbol = trade.get("symbol", "?")
+    shares = trade.get("shares", 0)
+    price = trade.get("price", 0)
+    gross = trade.get("gross", trade.get("net", 0))
+    return f"{symbol} {shares} @ ₹{price} ({_format_money(float(gross or 0))})"
+
+
+def _format_paper_rebalance_alert(
+    trades: list[dict],
+    signal_date: str,
+    valuation_date: str,
+    current_value: float,
+    position_count: int,
+) -> str:
+    """Create a concise paper BUY/SELL Telegram alert for a rebalance."""
+    sells = [t for t in trades if t.get("action") == "SELL"]
+    buys = [t for t in trades if t.get("action") == "BUY"]
+    host = socket.gethostname()
+    lines = [
+        "[PAPER][RSI-MOM] Rebalance signal",
+        f"Server: {host}",
+        f"Signal: {signal_date} | Valuation: {valuation_date}",
+        f"Portfolio: {_format_money(current_value)} | Positions: {position_count}",
+    ]
+    if sells:
+        lines.append(f"SELL {len(sells)}:")
+        lines.extend(f"- {_format_trade_line(t)}" for t in sells)
+    if buys:
+        lines.append(f"BUY {len(buys)}:")
+        lines.extend(f"- {_format_trade_line(t)}" for t in buys)
+    lines.append("Paper only — no real Kite orders placed by this ledger.")
+    return "\n".join(lines)
+
+
+def send_paper_telegram_alert(message: str) -> bool:
+    """Send paper-ledger alert using the same Telegram token/channel as live trader."""
+    if not TELEGRAM_ALERTS:
+        return False
+    try:
+        from Auto_Trader.my_secrets import CHANNEL, TG_TOKEN
+        from telegram import Bot
+    except Exception as exc:
+        print(f"WARN: Telegram alert unavailable: {exc}")
+        return False
+
+    if not TG_TOKEN or not CHANNEL:
+        print("WARN: Telegram alert skipped: TG_TOKEN/CHANNEL not configured")
+        return False
+
+    chat_id = os.getenv("AT_TEST_TRADER_CHANNEL", "").strip() or CHANNEL
+    try:
+        bot = Bot(token=TG_TOKEN)
+        asyncio.run(bot.send_message(chat_id=chat_id, text=message))
+        return True
+    except Exception as exc:
+        print(f"WARN: Telegram alert failed: {exc}")
+        return False
 
 
 # ── Core simulation ──────────────────────────────────────────
@@ -331,13 +398,17 @@ def main() -> int:
     state = load_state()
 
     # Check if rebalance needed
+    new_trades: list[dict] = []
+    trade_log_len_before = len(state.trade_log)
     if should_rebalance(state, signal, signal_date):
         print(f"REBALANCE: signal {signal_date} is newer than last rebalance {state.last_rebalance_date}")
         state = execute_rebalance(state, picks, signal_prices, signal_date)
+        new_trades = state.trade_log[trade_log_len_before:]
     elif not state.positions:
         # First run — initialize with current signal
         print(f"INIT: first run, buying {len(picks)} picks from signal {signal_date}")
         state = execute_rebalance(state, picks, signal_prices, signal_date)
+        new_trades = state.trade_log[trade_log_len_before:]
 
     # MTM current positions — prefer live prices from rt_compute, fall back to Hist_Data
     LIVE_PRICE_FILE = ROOT / "reports" / "live_prices.json"
@@ -410,8 +481,21 @@ def main() -> int:
     # Compute metrics
     metrics = compute_metrics(state.daily_values)
 
-    # Save state
+    # Save state before sending Telegram so a notification retry cannot duplicate
+    # the same paper rebalance on the next 5-minute cron tick.
     save_state(state)
+
+    telegram_alert_sent = False
+    if new_trades:
+        telegram_alert_sent = send_paper_telegram_alert(
+            _format_paper_rebalance_alert(
+                new_trades,
+                signal_date=signal_date,
+                valuation_date=valuation_date,
+                current_value=current_value,
+                position_count=len(state.positions),
+            )
+        )
 
     # Build output
     positions_detail = {}
@@ -453,6 +537,11 @@ def main() -> int:
             "created_at": state.created_at,
         },
         "metrics": metrics,
+        "telegram_alert": {
+            "enabled": TELEGRAM_ALERTS,
+            "rebalance_trade_count": len(new_trades),
+            "sent": telegram_alert_sent,
+        },
         "latest_trades": state.trade_log[-20:],
     }
 
