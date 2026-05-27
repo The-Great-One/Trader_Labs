@@ -260,19 +260,30 @@ def should_rebalance(state: PortfolioState, signal: dict, today: str) -> bool:
 
 
 def log_daily(state: PortfolioState, value: float, date: str) -> None:
-    """Record daily portfolio value."""
-    if state.daily_values:
-        prev_value = state.daily_values[-1]["value"]
-        daily_return = (value / prev_value) - 1 if prev_value > 0 else 0.0
-    else:
-        daily_return = 0.0
-    state.daily_values.append({
+    """Record/refresh portfolio value for a trading day.
+
+    The ledger can run intraday/hourly. For metrics, keep one observation per
+    trading date by replacing the same-date entry instead of appending multiple
+    fake "daily" returns in one day.
+    """
+    rounded_value = round(value, 2)
+    entry = {
         "date": date,
-        "value": round(value, 2),
-        "return_pct": round(daily_return * 100, 4),
+        "value": rounded_value,
         "positions": len(state.positions),
         "cash": round(state.cash, 2),
-    })
+    }
+
+    if state.daily_values and state.daily_values[-1].get("date") == date:
+        # Preserve the return versus the prior trading day while refreshing MTM.
+        prev_value = state.daily_values[-2]["value"] if len(state.daily_values) > 1 else rounded_value
+        entry["return_pct"] = round(((rounded_value / prev_value) - 1) * 100, 4) if prev_value > 0 else 0.0
+        state.daily_values[-1] = entry
+    else:
+        prev_value = state.daily_values[-1]["value"] if state.daily_values else rounded_value
+        entry["return_pct"] = round(((rounded_value / prev_value) - 1) * 100, 4) if prev_value > 0 else 0.0
+        state.daily_values.append(entry)
+
     # Keep last 2 years
     if len(state.daily_values) > 504:
         state.daily_values = state.daily_values[-504:]
@@ -327,14 +338,60 @@ def main() -> int:
         print(f"INIT: first run, buying {len(picks)} picks from signal {signal_date}")
         state = execute_rebalance(state, picks, signal_prices, signal_date)
 
-    # MTM current positions — use last available price per position symbol
-    prices_dict = {}
+    # MTM current positions — prefer live prices from rt_compute, fall back to Hist_Data
+    LIVE_PRICE_FILE = ROOT / "reports" / "live_prices.json"
+
+    prices_dict: dict[str, float] = {}
+    price_sources: dict[str, str] = {}
+    live_time = ""
+    live_age_sec: float | None = None
+    fresh_live_count = 0
+
+    if LIVE_PRICE_FILE.exists():
+        try:
+            live = json.loads(LIVE_PRICE_FILE.read_text())
+            live_time = live.get("time", "")
+            live_prices = live.get("prices", {})
+            price_times = live.get("price_times", {}) if isinstance(live.get("price_times"), dict) else {}
+            # Only use fresh per-symbol ticks (within 120 seconds; rt_compute publishes every ~5s during market hours).
+            live_dt = datetime.fromisoformat(live_time)
+            live_age_sec = (datetime.now() - live_dt).total_seconds()
+            if live_prices:
+                for sym in state.positions:
+                    px = float(live_prices.get(sym, 0.0) or 0.0)
+                    if px <= 0:
+                        continue
+                    sym_time = price_times.get(sym) or live_time
+                    sym_dt = datetime.fromisoformat(sym_time)
+                    sym_age = (datetime.now() - sym_dt).total_seconds()
+                    if sym_age < 120:
+                        prices_dict[sym] = px
+                        price_sources[sym] = f"live:{sym_time}"
+                        fresh_live_count += 1
+        except Exception:
+            pass
+
+    # Fall back to Hist_Data for any positions not covered by live feed.
+    hist_fallback_count = 0
     for sym in state.positions:
+        if sym in prices_dict:
+            continue
         if sym in prices_df.columns:
             col = prices_df[sym].ffill()
             last_valid = col.last_valid_index()
             if last_valid is not None and col.loc[last_valid] > 0:
                 prices_dict[sym] = float(col.loc[last_valid])
+                price_sources[sym] = f"hist_data:{last_valid.date()}"
+                hist_fallback_count += 1
+
+    missing_price_symbols = sorted(set(state.positions) - set(prices_dict))
+    if fresh_live_count and hist_fallback_count:
+        price_source = f"mixed_live_hist ({fresh_live_count} live, {hist_fallback_count} hist; live {live_time})"
+    elif fresh_live_count:
+        price_source = f"live ({live_time})"
+    else:
+        price_source = "hist_data"
+
     current_value = portfolio_value(state, prices_dict)
 
     # Log daily value
@@ -357,6 +414,7 @@ def main() -> int:
                 "shares": round(shares, 2),
                 "avg_price": round(cost, 2),
                 "current_price": round(px, 2),
+                "price_source": price_sources.get(sym, "unknown"),
                 "market_value": round(mv, 2),
                 "pnl_pct": round((px / cost - 1) * 100, 2) if cost > 0 else 0.0,
             }
@@ -373,6 +431,12 @@ def main() -> int:
             "position_value": round(current_value - state.cash, 2),
             "total_value": round(current_value, 2),
             "positions_count": len(state.positions),
+            "price_source": price_source,
+            "live_price_time": live_time,
+            "live_price_age_sec": round(live_age_sec, 1) if live_age_sec is not None else None,
+            "live_positions_priced": fresh_live_count,
+            "hist_positions_priced": hist_fallback_count,
+            "missing_price_symbols": missing_price_symbols,
             "positions": positions_detail,
             "last_rebalance": state.last_rebalance_date,
             "created_at": state.created_at,
@@ -385,7 +449,7 @@ def main() -> int:
 
     # Print summary
     print(f"\n=== RSI Momentum Paper Ledger ===")
-    print(f"Date: {today} | Signal: {signal_date} | Picks: {len(picks)}")
+    print(f"Date: {today} | Signal: {signal_date} | Picks: {len(picks)} | Price source: {price_source}")
     print(f"Portfolio:  ₹{current_value:,.2f}  (Cash: ₹{state.cash:,.2f}, Positions: {len(state.positions)})")
     if "total_return_pct" in metrics:
         print(f"Return:     {metrics['total_return_pct']:+.2f}%  CAGR: {metrics.get('cagr_pct', 0):+.2f}%")
