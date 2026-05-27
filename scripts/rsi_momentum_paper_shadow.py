@@ -54,7 +54,7 @@ def load_hist(hist_dir: Path) -> pd.DataFrame:
         if date_col is None or close_col is None:
             continue
 
-        df[date_col] = pd.to_datetime(df[date_col])
+        df[date_col] = pd.to_datetime(df[date_col]).dt.tz_localize(None)
         s = df.set_index(date_col)[close_col].dropna().sort_index()
         if len(s) >= MIN_ROWS:
             loaded[symbol] = s
