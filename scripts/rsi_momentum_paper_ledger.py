@@ -37,6 +37,7 @@ COST_BPS = float(os.getenv("RSI_LEDGER_COST_BPS", "10"))
 PAPER_SHADOW_FILE = OUT_DIR / "paper_shadow_rsi_momentum_latest.json"
 STATE_FILE = OUT_DIR / "paper_ledger_rsi_momentum_state.json"
 OUTPUT_FILE = OUT_DIR / "paper_ledger_rsi_momentum_latest.json"
+LIVE_PRICE_MAX_AGE_SEC = float(os.getenv("RSI_LEDGER_LIVE_MAX_AGE_SEC", "600"))
 
 
 # ── Data loading ──────────────────────────────────────────────
@@ -353,7 +354,9 @@ def main() -> int:
             live_time = live.get("time", "")
             live_prices = live.get("prices", {})
             price_times = live.get("price_times", {}) if isinstance(live.get("price_times"), dict) else {}
-            # Only use fresh per-symbol ticks (within 120 seconds; rt_compute publishes every ~5s during market hours).
+            # Use fresh per-symbol ticks. Some paper positions do not tick every
+            # few seconds, so default freshness is 10 minutes, configurable via
+            # RSI_LEDGER_LIVE_MAX_AGE_SEC.
             live_dt = datetime.fromisoformat(live_time)
             live_age_sec = (datetime.now() - live_dt).total_seconds()
             if live_prices:
@@ -364,7 +367,7 @@ def main() -> int:
                     sym_time = price_times.get(sym) or live_time
                     sym_dt = datetime.fromisoformat(sym_time)
                     sym_age = (datetime.now() - sym_dt).total_seconds()
-                    if sym_age < 120:
+                    if sym_age < LIVE_PRICE_MAX_AGE_SEC:
                         prices_dict[sym] = px
                         price_sources[sym] = f"live:{sym_time}"
                         fresh_live_count += 1
@@ -392,10 +395,17 @@ def main() -> int:
     else:
         price_source = "hist_data"
 
+    valuation_date = today
+    if fresh_live_count and live_time:
+        try:
+            valuation_date = str(datetime.fromisoformat(live_time).date())
+        except Exception:
+            valuation_date = today
+
     current_value = portfolio_value(state, prices_dict)
 
-    # Log daily value
-    log_daily(state, current_value, today)
+    # Log/refresh portfolio value for this valuation date
+    log_daily(state, current_value, valuation_date)
 
     # Compute metrics
     metrics = compute_metrics(state.daily_values)
@@ -421,6 +431,7 @@ def main() -> int:
 
     output = {
         "generated_at": datetime.now().isoformat(),
+        "valuation_date": valuation_date,
         "strategy": "rsi_momentum_rotation_paper_ledger",
         "signal": {
             "date": signal_date,
@@ -449,7 +460,7 @@ def main() -> int:
 
     # Print summary
     print(f"\n=== RSI Momentum Paper Ledger ===")
-    print(f"Date: {today} | Signal: {signal_date} | Picks: {len(picks)} | Price source: {price_source}")
+    print(f"Date: {valuation_date} | Signal: {signal_date} | Picks: {len(picks)} | Price source: {price_source}")
     print(f"Portfolio:  ₹{current_value:,.2f}  (Cash: ₹{state.cash:,.2f}, Positions: {len(state.positions)})")
     if "total_return_pct" in metrics:
         print(f"Return:     {metrics['total_return_pct']:+.2f}%  CAGR: {metrics.get('cagr_pct', 0):+.2f}%")
