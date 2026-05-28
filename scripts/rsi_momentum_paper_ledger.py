@@ -34,7 +34,10 @@ HIST_DIR = ROOT / "intermediary_files" / "Hist_Data"
 OUT_DIR.mkdir(exist_ok=True)
 
 # Config
-INITIAL_CAPITAL = float(os.getenv("RSI_LEDGER_CAPITAL", "1000000"))  # ₹10L
+# Match the paper deployment request and live-trader constraints:
+# - ₹2L starting book by default
+# - whole-share fills with residual cash, no fractional equity shares
+INITIAL_CAPITAL = float(os.getenv("RSI_LEDGER_CAPITAL", "200000"))
 COST_BPS = float(os.getenv("RSI_LEDGER_COST_BPS", "10"))
 PAPER_SHADOW_FILE = OUT_DIR / "paper_shadow_rsi_momentum_latest.json"
 STATE_FILE = OUT_DIR / "paper_ledger_rsi_momentum_state.json"
@@ -236,31 +239,56 @@ def execute_rebalance(
     state.positions.clear()
     state.cost_basis.clear()
 
-    # 2. Buy new picks equal-weight
+    # 2. Buy new picks equal-weight using whole shares.
+    # This mirrors the live equity environment more closely than fractional
+    # shares: each target bucket gets a budget, buys floor(budget / all-in px),
+    # and leaves uninvested residual cash in the ledger.
     available = [s for s in picks if s in prices_series and pd.notna(prices_series[s]) and prices_series[s] > 0]
     if not available:
         state.last_rebalance_date = date
         return state
 
     per_symbol_capital = state.cash / len(available)
+    skipped = []
     for symbol in available:
         px = float(prices_series[symbol])
-        gross_allocation = per_symbol_capital
-        cost = gross_allocation * cost_rate
-        net_allocation = gross_allocation - cost
-        shares = net_allocation / px
-        state.positions[symbol] = shares
+        all_in_px = px * (1 + cost_rate)
+        shares = math.floor(per_symbol_capital / all_in_px)
+        if shares <= 0:
+            skipped.append(symbol)
+            continue
+        gross = shares * px
+        cost = gross * cost_rate
+        debit = gross + cost
+        if debit > state.cash:
+            shares = math.floor(state.cash / all_in_px)
+            if shares <= 0:
+                skipped.append(symbol)
+                continue
+            gross = shares * px
+            cost = gross * cost_rate
+            debit = gross + cost
+        state.positions[symbol] = float(shares)
         state.cost_basis[symbol] = px
-        state.cash -= gross_allocation
+        state.cash -= debit
         state.trade_log.append({
             "date": date,
             "action": "BUY",
             "symbol": symbol,
-            "shares": round(shares, 2),
+            "shares": int(shares),
             "price": round(px, 2),
-            "gross": round(gross_allocation, 2),
+            "gross": round(gross, 2),
             "cost": round(cost, 2),
-            "net": round(net_allocation, 2),
+            "net": round(debit, 2),
+        })
+
+    for symbol in skipped:
+        state.trade_log.append({
+            "date": date,
+            "action": "SKIP",
+            "symbol": symbol,
+            "reason": "insufficient per-symbol capital for one whole share",
+            "price": round(float(prices_series[symbol]), 2),
         })
 
     state.last_rebalance_date = date
@@ -522,9 +550,11 @@ def main() -> int:
             "picks": picks,
         },
         "portfolio": {
+            "initial_capital": INITIAL_CAPITAL,
             "cash": round(state.cash, 2),
             "position_value": round(current_value - state.cash, 2),
             "total_value": round(current_value, 2),
+            "deployment_pct": round(((current_value - state.cash) / current_value) * 100, 2) if current_value > 0 else 0.0,
             "positions_count": len(state.positions),
             "price_source": price_source,
             "live_price_time": live_time,
