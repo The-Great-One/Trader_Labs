@@ -16,12 +16,19 @@ from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
 
-import numpy as np
 import pandas as pd
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
+
+from scripts.rsi_momentum_report import find_hist_dir, run_is_headline
+from scripts.rsi_momentum_robustness_report import strategy_daily_returns
+from scripts.rsi_224466_rotation_lab import (
+    load_prices as lab_load_prices,
+    rebalance_dates as lab_rebalance_dates,
+    rsi_dataframe as lab_rsi,
+)
 
 OUT_DIR = ROOT / "reports"
 HIST_DIR = ROOT / "intermediary_files" / "Hist_Data"
@@ -31,49 +38,22 @@ OUT_DIR.mkdir(exist_ok=True)
 TOP_N = int(os.getenv("RSI_MOM_TOP_N", "10"))
 COST_BPS = float(os.getenv("RSI_MOM_COST_BPS", "10"))
 MOMENTUM_PERIOD = int(os.getenv("RSI_MOM_MOMENTUM_PERIOD", "21"))
-MIN_ROWS = int(os.getenv("RSI_MOM_MIN_ROWS", "500"))
+MIN_ROWS = int(os.getenv("RSI_MOM_MIN_ROWS", "700"))
+MIN_END_DATE = os.getenv("RSI_MOM_MIN_END_DATE", "2026-04-17")
 
 
 def load_hist(hist_dir: Path) -> pd.DataFrame:
-    """Load close prices from feather files."""
+    """Load the same research-grade price matrix used by the official validator."""
     if not hist_dir.is_dir():
         return pd.DataFrame()
-    loaded = {}
-    for fpath in sorted(hist_dir.glob("*.feather")):
-        symbol = fpath.stem
-        try:
-            df = pd.read_feather(fpath)
-        except Exception:
-            continue
-        # Skip derivatives
-        if any(kw in symbol for kw in ["FUT", "OPT", "-I", "-II"]):
-            continue
-
-        date_col = next((c for c in ["date", "Date", "datetime"] if c in df.columns), None)
-        close_col = next((c for c in ["close", "Close", "CLOSE"] if c in df.columns), None)
-        if date_col is None or close_col is None:
-            continue
-
-        df[date_col] = pd.to_datetime(df[date_col]).dt.tz_localize(None)
-        s = df.set_index(date_col)[close_col].dropna().sort_index()
-        if len(s) >= MIN_ROWS:
-            loaded[symbol] = s
-
-    return pd.DataFrame(loaded).sort_index()
-
-
-def rsi(prices: pd.Series, period: int) -> pd.Series:
-    delta = prices.diff()
-    gain = delta.clip(lower=0).ewm(alpha=1.0 / period, min_periods=period).mean()
-    loss = (-delta.clip(upper=0)).ewm(alpha=1.0 / period, min_periods=period).mean()
-    rs = gain / loss.replace(0, np.nan)
-    return 100.0 - (100.0 / (1.0 + rs))
-
-
-def month_end_dates(index: pd.DatetimeIndex) -> list[pd.Timestamp]:
-    """Last trading day of each month."""
-    df = pd.DataFrame({"d": index, "m": index.to_period("M")})
-    return [g.iloc[-1]["d"] for _, g in df.groupby("m")]
+    prices_raw, _ctx = lab_load_prices(
+        hist_dir,
+        min_rows=MIN_ROWS,
+        min_end_date=MIN_END_DATE,
+        symbols=set(),
+        max_symbols=0,
+    )
+    return prices_raw.ffill(limit=3)
 
 
 def compute_rotation(prices: pd.DataFrame, top_n: int = TOP_N) -> dict:
@@ -81,77 +61,62 @@ def compute_rotation(prices: pd.DataFrame, top_n: int = TOP_N) -> dict:
     if prices.empty or len(prices.columns) < top_n:
         return {"error": "insufficient symbols", "symbols_loaded": len(prices.columns)}
 
-    prices_ffill = prices.ffill(limit=3)
-    mom_1m = prices_ffill.pct_change(MOMENTUM_PERIOD)
+    prices_ffill = prices
+    mom_1m = prices_ffill.pct_change(MOMENTUM_PERIOD, fill_method=None)
 
     # RSI composite score
-    rsi22 = prices_ffill.apply(lambda c: rsi(c, 22))
-    rsi44 = prices_ffill.apply(lambda c: rsi(c, 44))
-    rsi66 = prices_ffill.apply(lambda c: rsi(c, 66))
+    rsi22 = lab_rsi(prices_ffill, 22)
+    rsi44 = lab_rsi(prices_ffill, 44)
+    rsi66 = lab_rsi(prices_ffill, 66)
     score = (rsi22 + rsi44 + rsi66) / 3.0
 
     # Monthly rebalance dates
-    dates = month_end_dates(prices_ffill.index)
+    dates = lab_rebalance_dates(prices_ffill.index, "ME")
     if len(dates) < 1:
         return {"error": "no rebalance dates"}
-
-    # Latest signal
-    latest_date = dates[-1]
-    rsi_scores = score.loc[latest_date].dropna()
-    mom_scores = mom_1m.loc[latest_date]
-
-    # Filter: positive 1-month momentum, then rank by RSI score
-    valid = rsi_scores[mom_scores > 0]
-    ranked = valid.sort_values(ascending=False)
-
-    picks = list(ranked.head(top_n).index)
-    pick_scores = {s: round(float(ranked[s]), 2) for s in picks}
-
-    # Historical backtest simulation for CAGR estimate
-    weights = pd.DataFrame(0.0, index=prices_ffill.index, columns=prices_ffill.columns)
-    turnover = pd.Series(0.0, index=prices_ffill.index)
-    previous = pd.Series(0.0, index=prices_ffill.columns)
-    returns = prices_ffill.pct_change(fill_method=None).fillna(0)
-
-    for i, d in enumerate(dates):
+    actionable_dates = []
+    for d in dates:
         pos = prices_ffill.index.get_loc(d)
-        if pos + 1 >= len(prices_ffill.index):
-            continue
-        trade_date = prices_ffill.index[pos + 1]
-        end_date = dates[i + 1] if i + 1 < len(dates) else prices_ffill.index[-1]
-        target = pd.Series(0.0, index=prices_ffill.columns)
-        rsi_at = score.loc[d].dropna()
-        mom_at = mom_1m.loc[d]
-        combined = rsi_at[mom_at > 0]
-        sc = combined.sort_values(ascending=False)
-        sel = [s for s in sc.index if s in prices_ffill.columns and pd.notna(prices_ffill.loc[d, s]) and sc[s] > 0][:top_n]
-        if sel:
-            target.loc[sel] = 1.0 / len(sel)
-        turnover.loc[trade_date] = abs(target - previous).sum()
-        previous = target
-        mask = (prices_ffill.index >= trade_date) & (prices_ffill.index <= end_date)
-        weights.loc[mask, :] = target.values
+        if pos + 1 < len(prices_ffill.index):
+            actionable_dates.append(d)
+    if not actionable_dates:
+        return {"error": "no actionable rebalance dates"}
 
-    gross = (weights * returns).sum(axis=1)
-    net = gross - turnover * (COST_BPS / 10000.0)
-    active = weights.sum(axis=1) > 0
-    if not active.any():
+    # Latest actionable signal (must have a next trading day for execution parity)
+    latest_date = actionable_dates[-1]
+    latest_picks: list[str] = []
+    latest_pick_scores: dict[str, float] = {}
+    latest_screened_count = 0
+
+    # Historical backtest simulation — reuse the validated helper to avoid drift.
+    r, pick_log = strategy_daily_returns(
+        prices_ffill,
+        top_n=top_n,
+        cost_bps=COST_BPS,
+        momentum_period=MOMENTUM_PERIOD,
+    )
+    if r.empty or not pick_log:
         return {"error": "no active periods in backtest"}
-
-    r = net.loc[active]
     eq = (1 + r).cumprod()
-    years = len(r) / 252
-    cagr = eq.iloc[-1] ** (1 / years) - 1 if years > 0 else 0
-    xirr = cagr  # single initial allocation, no cashflows
-    dd = float((eq / eq.cummax() - 1).min())
-    vol = r.std() * (252 ** 0.5)
-    sharpe = (r.mean() * 252) / vol if vol > 0 else 0.0
-    yearly = r.groupby(r.index.year).apply(lambda x: (1 + x).prod() - 1)
+
+    for row in pick_log:
+        if row["signal_date"] == str(latest_date.date()):
+            latest_picks = list(row["picks"])
+            latest_pick_scores = {s: round(float(score.loc[latest_date, s]), 2) for s in latest_picks}
+            combined = score.loc[latest_date].where(mom_1m.loc[latest_date] > 0, 0)
+            latest_screened_count = int((combined > 0).sum())
+            break
 
     # Last 12 months performance
-    last_12m = net.last("365D") if len(net) > 252 else net
+    if len(r) > 252:
+        last_start = r.index[-1] - pd.Timedelta(days=365)
+        last_12m = r.loc[r.index >= last_start]
+    else:
+        last_12m = r
     eq_12m = (1 + last_12m).cumprod()
     ret_12m = eq_12m.iloc[-1] - 1 if len(eq_12m) > 0 else 0.0
+
+    headline = run_is_headline(prices_ffill, top_n=top_n, cost_bps=COST_BPS)
 
     return {
         "generated_at": datetime.now().isoformat(),
@@ -163,23 +128,23 @@ def compute_rotation(prices: pd.DataFrame, top_n: int = TOP_N) -> dict:
         },
         "latest_signal": {
             "date": str(latest_date.date()),
-            "picks": picks,
-            "scores": pick_scores,
-            "symbols_screened": len(valid),
+            "picks": latest_picks,
+            "scores": latest_pick_scores,
+            "symbols_screened": latest_screened_count,
         },
         "backtest_metrics": {
             "symbols_loaded": len(prices_ffill.columns),
-            "date_range": [str(r.index[0].date()), str(r.index[-1].date())],
-            "days": int(len(r)),
-            "years": round(years, 2),
-            "cagr_pct": round(float(cagr * 100), 2),
-            "xirr_pct": round(float(xirr * 100), 2),
-            "total_return_pct": round(float((eq.iloc[-1] - 1) * 100), 1),
-            "max_drawdown_pct": round(float(dd * 100), 2),
-            "vol_pct": round(float(vol * 100), 1),
-            "sharpe": round(float(sharpe), 3),
-            "positive_years": int((yearly > 0).sum()),
-            "total_years": int(len(yearly)),
+            "date_range": [headline["start"], headline["end"]],
+            "days": int(headline["days"]),
+            "years": round(len(r) / 252, 2),
+            "cagr_pct": headline["cagr_pct"],
+            "xirr_pct": headline["xirr_pct"],
+            "total_return_pct": headline["total_return_pct"],
+            "max_drawdown_pct": headline["max_drawdown_pct"],
+            "vol_pct": headline["vol_pct"],
+            "sharpe": headline["sharpe_like"],
+            "positive_years": headline["positive_years"],
+            "total_years": headline["total_years"],
             "return_12m_pct": round(float(ret_12m * 100), 1),
         },
     }
@@ -188,7 +153,7 @@ def compute_rotation(prices: pd.DataFrame, top_n: int = TOP_N) -> dict:
 def main():
     import os
 
-    hist_dir = Path(os.getenv("RSI_MOM_HIST_DIR", str(HIST_DIR)))
+    hist_dir = Path(os.getenv("RSI_MOM_HIST_DIR", str(find_hist_dir(""))))
     if not hist_dir.is_dir():
         print(f"ERROR: Hist_Data dir not found at {hist_dir}")
         return 1
