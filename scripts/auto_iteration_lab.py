@@ -1,30 +1,34 @@
 #!/usr/bin/env python3
-"""Auto-iteration strategy lab — runs on Oracle during non-market hours.
+"""Auto-iteration strategy lab v4 — self-improving enhancement framework.
 
-Tests multiple strategy families with parameter sweeps, saves results
-incrementally. Designed to be cron-scheduled (e.g., every night at 10 PM IST).
+Each night the lab:
+1. Reads the history of past results (auto_iteration_history.jsonl)
+2. Identifies the current best-performing enhancement
+3. Builds a parameter grid that:
+   a. Always re-tests the baseline (live params) as a control
+   b. Re-tests the current champion to confirm it still wins
+   c. Explores NEW variations around the champion's parameters
+   d. Tests one new enhancement idea it hasn't tried yet
+4. Saves results to history
+5. Outputs the latest report with champion + challengers
 
-Strategy families (sourced from Reddit r/algotrading):
-  1. Trend Following — MA cross, MACD, RSI momentum
-  2. Mean Reversion — RSI extremes, Bollinger Bands
-  3. Breakout + ATR — Donchian/price channel with trailing stop
-  4. Momentum Rotation — tactical allocation between symbols
-  5. Volatility Breakout — range expansion
-  6. Multi-Strategy — regime detection + strategy switching
+The lab evolves its search based on what actually worked in past runs,
+not a fixed grid. Over time it converges toward better and better configs.
 
-Output: reports/auto_iteration_latest.json
+Output:
+  reports/auto_iteration_latest.json  (latest run summary)
+  reports/auto_iteration_history.jsonl (append-only history)
 """
-
 from __future__ import annotations
 
 import json
 import os
+import random
 import sys
-from dataclasses import dataclass, asdict
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any
-
 import numpy as np
 import pandas as pd
 
@@ -36,839 +40,674 @@ REPO = Path(__file__).resolve().parents[1]
 if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
 
-from scripts import explore_strategies as ex
+from scripts.rsi_224466_rotation_lab import (  # noqa: E402
+    load_prices as lab_load_prices,
+    rebalance_dates as lab_rebalance_dates,
+    rsi_dataframe as lab_rsi,
+    build_regime_mask,
+)
 
 HIST_DIR = REPO / "intermediary_files" / "Hist_Data"
 OUTPUT = REPO / "reports" / "auto_iteration_latest.json"
+HISTORY = REPO / "reports" / "auto_iteration_history.jsonl"
+CONFIG = REPO / "config" / "auto_iteration_lab.json"
+SCORING_VERSION = "v5.1_calendar_consistency"
 OUTPUT.parent.mkdir(exist_ok=True)
 
-# ── Indicator computation ────────────────────────────────────────────────
-
-def _compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    """Compute all indicators needed across all strategy families."""
-    df = df.copy()
-    c = df["Close"]
-    h = df["High"]
-    l = df["Low"]
-    v = df["Volume"]
-
-    # SMAs
-    for p in [10, 20, 50, 100, 200]:
-        df[f"SMA{p}"] = c.rolling(p).mean()
-
-    # EMAs
-    for p in [9, 12, 21, 26, 50]:
-        df[f"EMA{p}"] = c.ewm(span=p, adjust=False).mean()
-
-    # MACD
-    ema12 = c.ewm(span=12, adjust=False).mean()
-    ema26 = c.ewm(span=26, adjust=False).mean()
-    df["MACD"] = ema12 - ema26
-    df["MACD_Signal"] = df["MACD"].ewm(span=9, adjust=False).mean()
-    df["MACD_Hist"] = df["MACD"] - df["MACD_Signal"]
-
-    # RSI for multiple periods
-    for rsi_p in [2, 7, 14, 21]:
-        delta = c.diff()
-        gain = delta.clip(lower=0)
-        loss = (-delta).clip(lower=0)
-        avg_gain = gain.ewm(alpha=1.0 / rsi_p, adjust=False).mean()
-        avg_loss = loss.ewm(alpha=1.0 / rsi_p, adjust=False).mean()
-        rs = avg_gain / avg_loss.replace(0, 1e-9)
-        df[f"RSI{rsi_p}"] = 100.0 - (100.0 / (1.0 + rs))
-
-    # ATR
-    tr = pd.concat([h - l, (h - c.shift(1)).abs(), (l - c.shift(1)).abs()], axis=1).max(axis=1)
-    df["ATR14"] = tr.rolling(14).mean()
-    df["ATR20"] = tr.rolling(20).mean()
-
-    # Bollinger Bands
-    for bb_p in [20]:
-        sma = c.rolling(bb_p).mean()
-        std = c.rolling(bb_p).std()
-        df[f"BB_upper_{bb_p}"] = sma + 2 * std
-        df[f"BB_lower_{bb_p}"] = sma - 2 * std
-        df[f"BB_mid_{bb_p}"] = sma
-        df[f"BB_width_{bb_p}"] = (df[f"BB_upper_{bb_p}"] - df[f"BB_lower_{bb_p}"]) / sma
-
-    # Volume ratio
-    df["Vol_SMA20"] = v.rolling(20).mean()
-    df["Vol_Ratio"] = v / df["Vol_SMA20"].replace(0, 1)
-
-    # Returns
-    df["Ret_1d"] = c.pct_change()
-    df["Ret_5d"] = c.pct_change(5)
-    df["Ret_20d"] = c.pct_change(20)
-
-    # High-low range
-    df["Range_pct"] = (h - l) / c.shift(1)
-
-    # Donchian channels
-    for dc_p in [10, 20]:
-        df[f"DC_upper_{dc_p}"] = h.rolling(dc_p).max().shift(1)
-        df[f"DC_lower_{dc_p}"] = l.rolling(dc_p).min().shift(1)
-
-    return df
+# Live production baseline (must match cron env)
+BASELINE = {
+    "rsi_periods": [22, 44, 66],
+    "momentum_period": 63,
+    "regime_mode": "sma100",
+    "use_macd": True,
+    "top_n": 8,
+    "rebalance_freq": "3W-FRI",
+    "cost_bps": 10.0,
+    "max_per_sector": 3,
+    "blend_weight": 0.3,
+}
 
 
-# ── Strategy simulators ──────────────────────────────────────────────────
-
-def _simulate(
-    df_raw: pd.DataFrame,
-    params: dict[str, Any],
-    start: pd.Timestamp,
-    end: pd.Timestamp,
-) -> dict[str, Any] | None:
-    """Route to the correct strategy simulator based on family."""
-    family = params.get("family", "trend")
-    if family == "trend":
-        return _sim_trend_following(df_raw, params, start, end)
-    elif family == "mean_reversion":
-        return _sim_mean_reversion(df_raw, params, start, end)
-    elif family == "breakout":
-        return _sim_breakout(df_raw, params, start, end)
-    elif family == "momentum_rotation":
-        return _sim_momentum_rotation(df_raw, params, start, end)
-    elif family == "vol_breakout":
-        return _sim_vol_breakout(df_raw, params, start, end)
-    else:
-        return None
+def _load_lab_config() -> dict[str, Any]:
+    """Load the lab's explicit qualification gates and scoring weights."""
+    try:
+        payload = json.loads(CONFIG.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"Unable to load lab configuration: {CONFIG}") from exc
+    consistency = payload.get("consistency")
+    if not isinstance(consistency, dict):
+        raise RuntimeError(f"Missing consistency configuration in {CONFIG}")
+    return payload
 
 
-def _get_date_mask(df: pd.DataFrame, start: pd.Timestamp, end: pd.Timestamp):
-    """Get valid index range for simulation."""
-    dates = pd.to_datetime(df["Date"]).dt.tz_localize(None)
-    mask = (dates >= start) & (dates <= end)
-    idxs = np.flatnonzero(mask.to_numpy())
-    if len(idxs) < 30:
-        return None, None
-    warmup = 220
-    start_idx = max(warmup, int(idxs[0]))
-    end_idx = int(idxs[-1])
-    if end_idx <= start_idx + 20:
-        return None, None
-    return start_idx, end_idx
-
-
-def _compute_metrics(
-    equity_curve: list[float],
-    trades: int,
-    wins: int,
-    holding_bars: list[int],
-    start_idx: int,
-    end_idx: int,
-    df: pd.DataFrame,
+def _consistency_metrics(
+    daily_returns: pd.Series,
+    *,
+    sharpe: float,
+    max_drawdown_pct: float,
+    avg_turnover: float,
+    cost_bps: float,
+    config: dict[str, Any],
 ) -> dict[str, Any]:
-    """Compute standard metrics from equity curve."""
-    final_equity = equity_curve[-1] if equity_curve else 100000.0
-    total_return = (final_equity - 100000.0) / 100000.0 * 100
+    """Score repeatability using complete calendar years and rolling 12-month returns."""
+    returns = daily_returns.sort_index().astype(float)
+    date_index = pd.DatetimeIndex(returns.index)
+    returns.index = date_index
+    yearly_returns: dict[str, float] = {}
+    yearly_counts: dict[int, int] = {}
+    years = np.array([int(str(timestamp)[:4]) for timestamp in date_index], dtype=int)
+    for year_number in np.unique(years):
+        values = returns.iloc[years == year_number]
+        year_number = int(year_number)
+        yearly_counts[year_number] = len(values)
+        yearly_returns[str(year_number)] = round(
+            float((np.prod(1.0 + values) - 1.0) * 100.0), 2
+        )
 
-    days = (df.iloc[end_idx]["Date"] - df.iloc[start_idx]["Date"]).days
-    years = max(days / 365.25, 0.1)
-    cagr = ((final_equity / 100000.0) ** (1.0 / years) - 1.0) * 100.0 if final_equity > 0 else -100.0
+    min_days = int(config["min_trading_days_per_year"])
+    complete_years = sorted(year for year, count in yearly_counts.items() if count >= min_days)
+    partial_years = sorted(year for year, count in yearly_counts.items() if count < min_days)
+    complete_returns = np.array(
+        [yearly_returns[str(year)] for year in complete_years], dtype=float
+    )
 
-    eq_a = np.array(equity_curve)
-    sharpe = 0.0
-    if len(eq_a) > 20 and eq_a[:-1].mean() > 0:
-        daily_ret = np.diff(eq_a) / (eq_a[:-1] + 1e-9)
-        sharpe = daily_ret.mean() / (daily_ret.std() + 1e-9) * np.sqrt(252)
+    median_year = float(np.median(complete_returns)) if len(complete_returns) else float("nan")
+    worst_year = float(np.min(complete_returns)) if len(complete_returns) else float("nan")
+    best_year = float(np.max(complete_returns)) if len(complete_returns) else float("nan")
+    annual_mad = (
+        float(np.median(np.abs(complete_returns - median_year)))
+        if len(complete_returns)
+        else float("nan")
+    )
+    positive_year_ratio = (
+        float(np.mean(complete_returns > 0.0)) if len(complete_returns) else 0.0
+    )
+    outlier_ratio = (
+        best_year / median_year
+        if len(complete_returns) and median_year > 0.0
+        else float("inf")
+    )
 
-    peak = np.maximum.accumulate(eq_a)
-    dd = (peak - eq_a) / peak * 100
-    max_dd = float(np.max(dd))
+    rolling_days = int(config["rolling_year_days"])
+    rolling_returns = (1.0 + returns).rolling(rolling_days).apply(np.prod, raw=True) - 1.0
+    rolling_min = (
+        float(rolling_returns.dropna().min() * 100.0)
+        if not rolling_returns.dropna().empty
+        else float("nan")
+    )
+
+    failures: list[str] = []
+    if len(complete_years) < int(config["min_complete_years"]):
+        failures.append("insufficient_complete_years")
+    if not len(complete_returns) or worst_year < float(config["min_year_return_pct"]):
+        failures.append("weak_worst_year")
+    if sharpe < float(config["min_sharpe_ratio"]):
+        failures.append("low_sharpe")
+    if cost_bps < float(config["min_cost_bps_for_champion"]):
+        failures.append("optimistic_transaction_costs")
+    if abs(max_drawdown_pct) > float(config["max_drawdown_abs_pct"]):
+        failures.append("excess_drawdown")
+    if outlier_ratio > float(config["max_year_to_median_ratio"]):
+        failures.append("year_outlier_ratio")
+    if not np.isfinite(rolling_min) or rolling_min < float(config["min_rolling_12m_return_pct"]):
+        failures.append("weak_rolling_12m")
+
+    weights = config["score_weights"]
+    outlier_limit = float(config["max_year_to_median_ratio"])
+    outlier_excess = (
+        max(0.0, best_year - outlier_limit * median_year)
+        if np.isfinite(best_year) and np.isfinite(median_year)
+        else 0.0
+    )
+    score = (
+        float(weights["worst_year"]) * (worst_year if np.isfinite(worst_year) else -100.0)
+        + float(weights["median_year"]) * (median_year if np.isfinite(median_year) else -100.0)
+        + float(weights["sharpe"]) * sharpe
+        + float(weights["rolling_12m_min"]) * (rolling_min if np.isfinite(rolling_min) else -100.0)
+        - float(weights["drawdown"]) * abs(max_drawdown_pct)
+        - float(weights["annual_mad"]) * (annual_mad if np.isfinite(annual_mad) else 100.0)
+        - float(weights["turnover"]) * avg_turnover
+        - float(weights["outlier_excess"]) * outlier_excess
+        - float(config["disqualification_penalty"]) * len(failures)
+    )
 
     return {
-        "total_return_pct": round(total_return, 2),
+        "scoring_version": SCORING_VERSION,
+        "calendar_year_returns": yearly_returns,
+        "complete_years": complete_years,
+        "partial_years": partial_years,
+        "positive_years": int(np.sum(complete_returns > 0.0)),
+        "total_years": len(complete_years),
+        "positive_year_ratio": round(positive_year_ratio, 3),
+        "worst_year_return_pct": round(worst_year, 2) if np.isfinite(worst_year) else None,
+        "median_year_return_pct": round(median_year, 2) if np.isfinite(median_year) else None,
+        "best_year_return_pct": round(best_year, 2) if np.isfinite(best_year) else None,
+        "annual_return_mad_pct": round(annual_mad, 2) if np.isfinite(annual_mad) else None,
+        "year_to_median_ratio": round(outlier_ratio, 3) if np.isfinite(outlier_ratio) else None,
+        "min_rolling_12m_return_pct": round(rolling_min, 2) if np.isfinite(rolling_min) else None,
+        "qualified": not failures,
+        "qualification_failures": failures,
+        "selection_score": round(score, 2),
+    }
+
+
+# Enhancement ideas the lab cycles through (one new one per night)
+ENHANCEMENT_IDEAS = [
+    # RSI tuning
+    {"rsi_periods": [10, 20, 30]},
+    {"rsi_periods": [14, 28, 42]},
+    {"rsi_periods": [20, 40, 60]},
+    {"rsi_periods": [30, 60, 90]},
+    {"rsi_periods": [7, 14, 21]},
+    # Momentum tuning
+    {"momentum_period": 21},
+    {"momentum_period": 42},
+    {"momentum_period": 84},
+    # Blend tuning
+    {"blend_weight": 0.0},
+    {"blend_weight": 0.15},
+    {"blend_weight": 0.25},
+    {"blend_weight": 0.35},
+    {"blend_weight": 0.4},
+    {"blend_weight": 0.5},
+    # Regime
+    {"regime_mode": "sma200"},
+    {"regime_mode": "none"},
+    {"use_universe_regime": True, "universe_regime_mode": "universe_sma100"},
+    {"use_universe_regime": True, "universe_regime_mode": "universe_sma200"},
+    # Top-N
+    {"top_n": 5},
+    {"top_n": 6},
+    {"top_n": 10},
+    {"top_n": 12},
+    # Rebalance
+    {"rebalance_freq": "W-FRI"},
+    {"rebalance_freq": "ME"},
+    {"rebalance_freq": "2W-FRI"},
+    # Cost sensitivity
+    {"cost_bps": 0},
+    {"cost_bps": 5},
+    {"cost_bps": 20},
+    # Sector
+    {"max_per_sector": 0},
+    {"max_per_sector": 2},
+    {"max_per_sector": 5},
+    # RSI thresholds
+    {"rsi_min": 50},
+    {"rsi_min": 55, "rsi_max": 80},
+    {"rsi_min": 45, "rsi_max": 70},
+    {"rsi_min": 40, "rsi_max": 75},
+    # Volatility weighting
+    {"vol_weight": True, "vol_lookback": 10},
+    {"vol_weight": True, "vol_lookback": 20},
+    {"vol_weight": True, "vol_lookback": 40},
+    # RSI acceleration
+    {"use_rsi_accel": True, "rsi_accel_weight": 0.10},
+    {"use_rsi_accel": True, "rsi_accel_weight": 0.15},
+    {"use_rsi_accel": True, "rsi_accel_weight": 0.25},
+    # Turnover penalty
+    {"turnover_penalty": 2.0},
+    {"turnover_penalty": 5.0},
+    {"turnover_penalty": 10.0},
+    # Dynamic top-N
+    {"dynamic_top_n": True},
+    # Drawdown exit
+    {"dd_exit_pct": -10},
+    {"dd_exit_pct": -15},
+    {"dd_exit_pct": -20},
+    # No filters (ablation)
+    {"use_macd": False},
+    {"regime_mode": "none", "use_macd": False},
+    # Combos
+    {"rsi_min": 50, "blend_weight": 0.3},
+    {"rsi_min": 50, "vol_weight": True, "vol_lookback": 20},
+    {"blend_weight": 0.3, "vol_weight": True, "vol_lookback": 20},
+    {"use_rsi_accel": True, "rsi_accel_weight": 0.15, "vol_weight": True, "vol_lookback": 20},
+    {"rsi_min": 50, "rsi_max": 80, "blend_weight": 0.3, "use_rsi_accel": True, "rsi_accel_weight": 0.15},
+    {"rsi_min": 50, "dd_exit_pct": -20, "blend_weight": 0.3},
+    {"momentum_period": 84, "blend_weight": 0.3, "rsi_min": 50},
+    {"rebalance_freq": "ME", "blend_weight": 0.3, "top_n": 10},
+    {"rebalance_freq": "3W-FRI", "blend_weight": 0.4, "momentum_period": 84},
+    {"rebalance_freq": "3W-FRI", "blend_weight": 0.3, "rsi_min": 50, "vol_weight": True, "vol_lookback": 20, "use_rsi_accel": True, "rsi_accel_weight": 0.15},
+    {"rebalance_freq": "3W-FRI", "blend_weight": 0.35, "momentum_period": 84, "rsi_min": 50, "use_universe_regime": True, "universe_regime_mode": "universe_sma100"},
+    {"rebalance_freq": "3W-FRI", "blend_weight": 0.3, "rsi_min": 45, "rsi_max": 75, "vol_weight": True, "vol_lookback": 20, "dd_exit_pct": -20},
+    {"rebalance_freq": "3W-FRI", "blend_weight": 0.3, "rsi_min": 50, "use_rsi_accel": True, "rsi_accel_weight": 0.15, "turnover_penalty": 5.0},
+    {"rebalance_freq": "3W-FRI", "blend_weight": 0.25, "momentum_period": 42, "rsi_min": 50, "use_rsi_accel": True, "rsi_accel_weight": 0.10},
+]
+
+
+def _load_instruments():
+    p = REPO / "intermediary_files" / "Instruments.feather"
+    return pd.read_feather(p) if p.exists() else pd.DataFrame()
+
+
+def _filter_universe(prices, instruments, min_vol=50000, min_mcap=500.0):
+    keep = []
+    for col in prices.columns:
+        sym = str(col).strip().upper()
+        f = HIST_DIR / f"{sym}.feather"
+        if min_vol > 0 and f.exists():
+            try:
+                df = pd.read_feather(f)
+                vc = "volume" if "volume" in df.columns else ("Volume" if "Volume" in df.columns else None)
+                if vc and df[vc].tail(20).mean() < min_vol:
+                    continue
+            except Exception:
+                pass
+        if min_mcap > 0 and not instruments.empty:
+            m = instruments[instruments["Symbol"].str.upper() == sym]
+            if not m.empty and "MarketCapCr" in m.columns:
+                mc = m.iloc[0]["MarketCapCr"]
+                if pd.notna(mc) and float(mc) < min_mcap:
+                    continue
+        keep.append(col)
+    return prices[keep]
+
+
+def _simulate(prices, params, instruments, consistency_config):
+    if prices.empty or len(prices) < 200:
+        return None
+
+    pf = prices.ffill(limit=3)
+    rsi_periods = tuple(params.get("rsi_periods", [22, 44, 66]))
+    score = sum(lab_rsi(pf, p) for p in rsi_periods) / len(rsi_periods)
+
+    mom_period = params.get("momentum_period", 63)
+    mom = pf.pct_change(mom_period, fill_method=None)
+
+    blend_w = params.get("blend_weight", 0.0)
+    if blend_w > 0:
+        mom_rank = mom.rank(axis=1, pct=True)
+        score = (1 - blend_w) * score + blend_w * (mom_rank * 100)
+
+    if params.get("use_rsi_accel", False):
+        rsi_roc = score.diff(5)
+        score = score + params.get("rsi_accel_weight", 0.15) * rsi_roc
+
+    regime_mode = params.get("regime_mode", "sma100")
+    if regime_mode == "none":
+        regime = (pf > 0).astype(float)
+    else:
+        rw = int(regime_mode.replace("sma", ""))
+        regime = (pf > pf.rolling(rw, min_periods=rw).mean()).astype(float)
+
+    if params.get("use_universe_regime", False):
+        uni_mask = build_regime_mask(pf, params.get("universe_regime_mode", "universe_sma100"))
+    else:
+        uni_mask = pd.Series(True, index=pf.index)
+
+    use_macd = params.get("use_macd", True)
+    if use_macd:
+        ema_f = pf.ewm(span=12, min_periods=12).mean()
+        ema_s = pf.ewm(span=26, min_periods=26).mean()
+        macd_line = ema_f - ema_s
+        macd_filter = (macd_line > macd_line.ewm(span=9, min_periods=9).mean()).astype(float)
+    else:
+        macd_filter = (pf > 0).astype(float)
+
+    rebalance_freq = params.get("rebalance_freq", "3W-FRI")
+    dates = lab_rebalance_dates(pf.index, rebalance_freq)
+    if len(dates) < 3:
+        return None
+    actionable = [d for d in dates if pf.index.get_loc(d) + 1 < len(pf.index)]
+    if len(actionable) < 3:
+        return None
+
+    returns = pf.pct_change(fill_method=None).fillna(0)
+    cost_rate = params.get("cost_bps", 10.0) / 10000.0
+    top_n = params.get("top_n", 8)
+    max_sec = params.get("max_per_sector", 3)
+    rsi_min = params.get("rsi_min", 0)
+    rsi_max = params.get("rsi_max", 100)
+    vol_weight = params.get("vol_weight", False)
+    vol_lb = params.get("vol_lookback", 20)
+    dynamic_n = params.get("dynamic_top_n", False)
+    turnover_pen = params.get("turnover_penalty", 0)
+    dd_exit = params.get("dd_exit_pct", 0)
+    portfolio_returns = []
+    portfolio_dates = []
+    prev_picks = set()
+    turnover_total = 0.0
+    rebalance_count = 0
+    entry_prices = {}
+
+    for i, d in enumerate(actionable):
+        ed = actionable[i + 1] if i + 1 < len(actionable) else pf.index[-1]
+
+        in_market = uni_mask.loc[d] if d in uni_mask.index else True
+        if not in_market:
+            period_mask = (returns.index > d) & (returns.index <= ed)
+            portfolio_returns.extend([0.0] * period_mask.sum())
+            portfolio_dates.extend(returns.index[period_mask].tolist())
+            prev_picks = set()
+            continue
+
+        rsi_at = score.loc[d].copy()
+        mom_at = mom.loc[d].copy()
+        combined = rsi_at.where(mom_at > 0, 0)
+        if d in regime.index:
+            combined = combined.where(regime.loc[d] > 0, 0)
+        if use_macd and d in macd_filter.index:
+            combined = combined.where(macd_filter.loc[d] > 0, 0)
+        combined = combined.where(rsi_at >= rsi_min, 0)
+        combined = combined.where(rsi_at <= rsi_max, 0)
+
+        if turnover_pen > 0 and prev_picks:
+            for s in prev_picks:
+                if s in combined.index and combined[s] > 0:
+                    combined[s] += turnover_pen
+
+        scored = combined.dropna().sort_values(ascending=False)
+        n_bullish = int((combined > 0).sum())
+        current_n = max(3, min(top_n, n_bullish // 5)) if dynamic_n else top_n
+
+        raw_picks = [s for s in scored.index if scored[s] > 0][:current_n * 2]
+
+        if max_sec > 0 and not instruments.empty:
+            sc = {}
+            filtered = []
+            for p in raw_picks:
+                m = instruments[instruments["Symbol"].str.upper() == p]
+                sec = str(m.iloc[0].get("Sector", "Unknown")) if not m.empty else "Unknown"
+                if sc.get(sec, 0) < max_sec:
+                    filtered.append(p)
+                    sc[sec] = sc.get(sec, 0) + 1
+                if len(filtered) >= current_n:
+                    break
+            picks = filtered[:current_n]
+        else:
+            picks = raw_picks[:current_n]
+
+        if not picks:
+            period_mask = (returns.index > d) & (returns.index <= ed)
+            portfolio_returns.extend([0.0] * period_mask.sum())
+            portfolio_dates.extend(returns.index[period_mask].tolist())
+            prev_picks = set()
+            continue
+
+        rebalance_count += 1
+        new_picks = set(picks)
+        turnover_total += len(new_picks.symmetric_difference(prev_picks)) / 2
+
+        if vol_weight:
+            vols = {}
+            for s in picks:
+                col = pf[s].loc[:d].tail(vol_lb)
+                vols[s] = float(col.pct_change().std()) if len(col) > 5 else 1.0
+            iv = {s: 1.0 / (v + 1e-9) for s, v in vols.items()}
+            ti = sum(iv.values())
+            weights = {s: iv[s] / ti for s in picks}
+        else:
+            weights = {s: 1.0 / len(picks) for s in picks}
+
+        period_mask = (returns.index > d) & (returns.index <= ed)
+        period_days = returns.loc[period_mask]
+
+        n_buy = len(new_picks - prev_picks) if i > 0 else len(picks)
+        n_sell = len(prev_picks - new_picks) if i > 0 else 0
+        tc = (n_buy + n_sell) * cost_rate / 2
+
+        exited = set()
+        daily_rets = []
+        for idx_date in period_days.index:
+            active = [s for s in picks if s not in exited]
+            day_ret = sum(weights.get(s, 0) * (period_days.loc[idx_date, s] if s in period_days.columns else 0.0) for s in active)
+            if dd_exit < 0:
+                for s in list(active):
+                    px = pf.loc[idx_date, s] if s in pf.columns else None
+                    if px and not pd.isna(px) and s in entry_prices and entry_prices[s] > 0:
+                        if (px / entry_prices[s] - 1) * 100 < dd_exit:
+                            exited.add(s)
+            daily_rets.append(day_ret - (tc / max(len(period_days), 1)))
+
+        portfolio_returns.extend(daily_rets)
+        portfolio_dates.extend(period_days.index.tolist())
+        entry_prices = {s: float(pf.loc[d, s]) for s in picks if s in pf.columns}
+        prev_picks = new_picks
+
+    if not portfolio_returns:
+        return None
+
+    rets = np.array(portfolio_returns)
+    eq = np.cumprod(1 + rets)
+    final = float(eq[-1])
+    days = len(portfolio_returns)
+    years = max(days / 252, 0.1)
+    cagr = ((final) ** (1 / years) - 1) * 100 if final > 0 else -100.0
+    peak = np.maximum.accumulate(eq)
+    max_dd = float(np.max((peak - eq) / (peak + 1e-9) * 100))
+    sharpe = float(rets.mean() / (rets.std() + 1e-9) * np.sqrt(252)) if len(rets) > 20 else 0.0
+
+    avg_turn = turnover_total / max(rebalance_count, 1)
+    consistency = _consistency_metrics(
+        pd.Series(rets, index=pd.DatetimeIndex(portfolio_dates)),
+        sharpe=sharpe,
+        max_drawdown_pct=-max_dd,
+        avg_turnover=avg_turn,
+        cost_bps=float(params.get("cost_bps", 0.0)),
+        config=consistency_config,
+    )
+
+    return {
+        "total_return_pct": round((final-1)*100, 2),
         "cagr_pct": round(cagr, 2),
         "max_drawdown_pct": round(-max_dd, 2),
-        "trades": trades,
-        "wins": wins,
-        "win_rate_pct": round(wins / max(trades, 1) * 100, 2),
-        "sharpe_ratio": round(sharpe, 2),
-        "avg_holding_bars": round(float(np.mean(holding_bars)), 1) if holding_bars else 0,
-        "final_equity": round(final_equity, 2),
+        "sharpe_ratio": round(sharpe, 3),
+        "avg_turnover": round(avg_turn, 1),
+        "rebalance_count": rebalance_count,
+        "final_equity": round(final * 100000, 2),
+        "universe_size": len(prices.columns),
+        **consistency,
     }
 
 
-# ── Strategy 1: Trend Following ──────────────────────────────────────────
-
-def _sim_trend_following(
-    df_raw: pd.DataFrame,
-    params: dict[str, Any],
-    start: pd.Timestamp,
-    end: pd.Timestamp,
-) -> dict[str, Any] | None:
-    """MA cross + RSI momentum trend following."""
-    df = _compute_indicators(df_raw)
-    start_idx, end_idx = _get_date_mask(df, start, end)
-    if start_idx is None:
-        return None
-
-    ma_fast = int(params.get("ma_fast", 20))
-    ma_slow = int(params.get("ma_slow", 50))
-    rsi_period = int(params.get("rsi_period", 14))
-    rsi_entry = float(params.get("rsi_entry", 50))  # enter when RSI > this
-    atr_mult = float(params.get("atr_mult", 2.0))
-    use_macd = bool(params.get("use_macd", False))
-
-    fast_col = f"SMA{ma_fast}" if ma_fast in [10, 20, 50, 100, 200] else f"EMA{ma_fast}"
-    slow_col = f"SMA{ma_slow}" if ma_slow in [10, 20, 50, 100, 200] else f"EMA{ma_slow}"
-    rsi_col = f"RSI{rsi_period}"
-
-    if fast_col not in df.columns:
-        df[fast_col] = df["Close"].ewm(span=ma_fast, adjust=False).mean()
-    if slow_col not in df.columns:
-        df[slow_col] = df["Close"].ewm(span=ma_slow, adjust=False).mean()
-
-    close = df["Close"].to_numpy(dtype=float)
-    fast_ma = df[fast_col].to_numpy(dtype=float)
-    slow_ma = df[slow_col].to_numpy(dtype=float)
-    rsi = df[rsi_col].to_numpy(dtype=float) if rsi_col in df.columns else np.full(len(close), 50.0)
-    atr = df["ATR14"].to_numpy(dtype=float)
-    macd_hist = df["MACD_Hist"].to_numpy(dtype=float) if use_macd else None
-
-    capital = 100000.0
-    qty = 0
-    entry_price = 0.0
-    highest_since_entry = 0.0
-    trades = 0
-    wins = 0
-    equity_curve: list[float] = []
-    holding_bars: list[int] = []
-    entry_idx: int | None = None
-
-    for i in range(start_idx, end_idx + 1):
-        price = close[i]
-        if np.isnan(price) or price <= 0:
-            if qty > 0:
-                capital += qty * max(close[max(0, i - 1)], 1.0)
-                qty = 0
-            equity_curve.append(capital)
+def _read_history():
+    """Read past results to find the champion."""
+    if not HISTORY.exists():
+        return []
+    results = []
+    for line in HISTORY.read_text().strip().split("\n"):
+        try:
+            results.append(json.loads(line))
+        except Exception:
             continue
-
-        if qty == 0:
-            # Entry: fast MA > slow MA AND RSI > threshold
-            f = fast_ma[i]
-            s = slow_ma[i]
-            r = rsi[i]
-            if np.isnan(f) or np.isnan(s):
-                equity_curve.append(capital)
-                continue
-
-            ma_ok = f > s
-            rsi_ok = r > rsi_entry
-            macd_ok = True
-            if use_macd and macd_hist is not None:
-                macd_ok = macd_hist[i] > 0
-
-            if ma_ok and rsi_ok and macd_ok:
-                invest = capital * 0.95
-                buy_qty = int(invest // price)
-                if buy_qty > 0:
-                    qty = buy_qty
-                    capital -= qty * price
-                    entry_price = price
-                    entry_idx = i
-                    highest_since_entry = price
-                    trades += 1
-        else:
-            bars_held = i - entry_idx if entry_idx is not None else 0
-            if price > highest_since_entry:
-                highest_since_entry = price
-
-            # Exit: fast MA crosses below slow MA OR trailing stop
-            exit_signal = False
-            f = fast_ma[i]
-            s = slow_ma[i]
-
-            if not np.isnan(f) and not np.isnan(s) and f < s and bars_held > 3:
-                exit_signal = True
-
-            trail_stop = highest_since_entry - atr_mult * atr[i]
-            if not np.isnan(trail_stop) and price < trail_stop and bars_held > 3:
-                exit_signal = True
-
-            if exit_signal:
-                capital += qty * price
-                pnl = (price - entry_price) * qty
-                if price > entry_price:
-                    wins += 1
-                holding_bars.append(bars_held)
-                qty = 0
-                entry_price = 0.0
-                entry_idx = None
-                highest_since_entry = 0.0
-
-        equity_curve.append(capital + qty * price)
-
-    if qty > 0:
-        price = float(close[end_idx])
-        capital += qty * price
-        if price > entry_price:
-            wins += 1
-        if entry_idx is not None:
-            holding_bars.append(end_idx - entry_idx)
-
-    return _compute_metrics(equity_curve, trades, wins, holding_bars, start_idx, end_idx, df)
+    return results
 
 
-# ── Strategy 2: Mean Reversion ───────────────────────────────────────────
-
-def _sim_mean_reversion(
-    df_raw: pd.DataFrame,
-    params: dict[str, Any],
-    start: pd.Timestamp,
-    end: pd.Timestamp,
-) -> dict[str, Any] | None:
-    """RSI oversold/overbought + Bollinger Band mean reversion."""
-    df = _compute_indicators(df_raw)
-    start_idx, end_idx = _get_date_mask(df, start, end)
-    if start_idx is None:
+def _find_champion(history):
+    """Return the best candidate that passes every consistency gate."""
+    qualified = [
+        entry
+        for entry in history
+        if entry.get("agg", {}).get("qualified") is True
+        and entry.get("agg", {}).get("scoring_version") == SCORING_VERSION
+    ]
+    if not qualified:
         return None
-
-    rsi_period = int(params.get("rsi_period", 14))
-    rsi_oversold = float(params.get("rsi_oversold", 30))
-    rsi_overbought = float(params.get("rsi_overbought", 70))
-    use_bb = bool(params.get("use_bb", True))
-    max_hold = int(params.get("max_hold", 20))
-
-    rsi_col = f"RSI{rsi_period}"
-    close = df["Close"].to_numpy(dtype=float)
-    rsi = df[rsi_col].to_numpy(dtype=float) if rsi_col in df.columns else np.full(len(close), 50.0)
-    bb_lower = df["BB_lower_20"].to_numpy(dtype=float) if use_bb else None
-    bb_upper = df["BB_upper_20"].to_numpy(dtype=float) if use_bb else None
-
-    capital = 100000.0
-    qty = 0
-    entry_price = 0.0
-    direction = 0  # 1=long, -1=short
-    trades = 0
-    wins = 0
-    equity_curve: list[float] = []
-    holding_bars: list[int] = []
-    entry_idx: int | None = None
-
-    for i in range(start_idx, end_idx + 1):
-        price = close[i]
-        if np.isnan(price) or price <= 0:
-            if qty > 0:
-                capital += qty * max(close[max(0, i - 1)], 1.0)
-                qty = 0
-            equity_curve.append(capital)
-            continue
-
-        if qty == 0:
-            r = rsi[i]
-            if np.isnan(r):
-                equity_curve.append(capital)
-                continue
-
-            # Long entry: RSI oversold + price below BB lower
-            long_signal = r < rsi_oversold
-            if use_bb and bb_lower is not None:
-                long_signal = long_signal and price < bb_lower[i]
-
-            # Short entry: RSI overbought + price above BB upper
-            short_signal = r > rsi_overbought
-            if use_bb and bb_upper is not None:
-                short_signal = short_signal and price > bb_upper[i]
-
-            if long_signal:
-                invest = capital * 0.95
-                buy_qty = int(invest // price)
-                if buy_qty > 0:
-                    qty = buy_qty
-                    capital -= qty * price
-                    entry_price = price
-                    direction = 1
-                    entry_idx = i
-                    trades += 1
-            elif short_signal:
-                # Simulate short: sell borrowed shares
-                invest = capital * 0.95
-                sell_qty = int(invest // price)
-                if sell_qty > 0:
-                    qty = sell_qty
-                    capital += qty * price  # receive cash
-                    entry_price = price
-                    direction = -1
-                    entry_idx = i
-                    trades += 1
-        else:
-            bars_held = i - entry_idx if entry_idx is not None else 0
-
-            # Exit: RSI crosses back to neutral OR time stop
-            r = rsi[i]
-            exit_signal = False
-
-            if direction == 1:
-                # Exit long when RSI > 50 (mean reversion complete)
-                if r > 50 and bars_held > 1:
-                    exit_signal = True
-            elif direction == -1:
-                # Exit short when RSI < 50
-                if r < 50 and bars_held > 1:
-                    exit_signal = True
-
-            if max_hold > 0 and bars_held >= max_hold:
-                exit_signal = True
-
-            if exit_signal:
-                if direction == 1:
-                    capital += qty * price
-                    pnl = (price - entry_price) * qty
-                else:
-                    capital -= qty * price
-                    pnl = (entry_price - price) * qty
-
-                if pnl > 0:
-                    wins += 1
-                holding_bars.append(bars_held)
-                qty = 0
-                direction = 0
-                entry_price = 0.0
-                entry_idx = None
-
-        if direction == 1:
-            equity_curve.append(capital + qty * price)
-        elif direction == -1:
-            equity_curve.append(capital - qty * price)
-        else:
-            equity_curve.append(capital)
-
-    if qty > 0:
-        price = float(close[end_idx])
-        if direction == 1:
-            capital += qty * price
-        else:
-            capital -= qty * price
-        if entry_idx is not None:
-            holding_bars.append(end_idx - entry_idx)
-
-    return _compute_metrics(equity_curve, trades, wins, holding_bars, start_idx, end_idx, df)
-
-
-# ── Strategy 3: Breakout + ATR ───────────────────────────────────────────
-
-def _sim_breakout(
-    df_raw: pd.DataFrame,
-    params: dict[str, Any],
-    start: pd.Timestamp,
-    end: pd.Timestamp,
-) -> dict[str, Any] | None:
-    """Donchian/price channel breakout with ATR trailing stop."""
-    df = _compute_indicators(df_raw)
-    start_idx, end_idx = _get_date_mask(df, start, end)
-    if start_idx is None:
-        return None
-
-    dc_period = int(params.get("dc_period", 20))
-    atr_trail = float(params.get("atr_trail", 2.5))
-    vol_mult = float(params.get("vol_mult", 1.0))
-    sma_period = int(params.get("sma_period", 50))
-
-    dc_col = f"DC_upper_{dc_period}"
-    sma_col = f"SMA{sma_period}" if sma_period in [10, 20, 50, 100, 200] else f"EMA{sma_period}"
-
-    close = df["Close"].to_numpy(dtype=float)
-    dc_upper = df[dc_col].to_numpy(dtype=float) if dc_col in df.columns else np.full(len(close), np.nan)
-    trend = df[sma_col].to_numpy(dtype=float) if sma_col in df.columns else np.full(len(close), np.nan)
-    atr = df["ATR14"].to_numpy(dtype=float)
-    vol_ratio = df["Vol_Ratio"].to_numpy(dtype=float)
-
-    capital = 100000.0
-    qty = 0
-    entry_price = 0.0
-    highest_since_entry = 0.0
-    trades = 0
-    wins = 0
-    equity_curve: list[float] = []
-    holding_bars: list[int] = []
-    entry_idx: int | None = None
-
-    for i in range(start_idx, end_idx + 1):
-        price = close[i]
-        if np.isnan(price) or price <= 0:
-            if qty > 0:
-                capital += qty * max(close[max(0, i - 1)], 1.0)
-                qty = 0
-            equity_curve.append(capital)
-            continue
-
-        if qty == 0:
-            upper = dc_upper[i]
-            if np.isnan(upper) or upper <= 0:
-                equity_curve.append(capital)
-                continue
-
-            breakout = price > upper
-            vol_ok = not np.isnan(vol_ratio[i]) and vol_ratio[i] >= vol_mult
-            trend_ok = not np.isnan(trend[i]) and price > trend[i]
-
-            if breakout and vol_ok and trend_ok:
-                invest = capital * 0.95
-                buy_qty = int(invest // price)
-                if buy_qty > 0:
-                    qty = buy_qty
-                    capital -= qty * price
-                    entry_price = price
-                    entry_idx = i
-                    highest_since_entry = price
-                    trades += 1
-        else:
-            bars_held = i - entry_idx if entry_idx is not None else 0
-            if price > highest_since_entry:
-                highest_since_entry = price
-
-            trail_stop = highest_since_entry - atr_trail * atr[i]
-            exit_signal = not np.isnan(trail_stop) and price < trail_stop and bars_held > 3
-
-            if exit_signal:
-                capital += qty * price
-                pnl = (price - entry_price) * qty
-                if price > entry_price:
-                    wins += 1
-                holding_bars.append(bars_held)
-                qty = 0
-                entry_price = 0.0
-                entry_idx = None
-                highest_since_entry = 0.0
-
-        equity_curve.append(capital + qty * price)
-
-    if qty > 0:
-        price = float(close[end_idx])
-        capital += qty * price
-        if price > entry_price:
-            wins += 1
-        if entry_idx is not None:
-            holding_bars.append(end_idx - entry_idx)
-
-    return _compute_metrics(equity_curve, trades, wins, holding_bars, start_idx, end_idx, df)
-
-
-# ── Strategy 4: Momentum Rotation ────────────────────────────────────────
-
-def _sim_momentum_rotation(
-    df_raw: pd.DataFrame,
-    params: dict[str, Any],
-    start: pd.Timestamp,
-    end: pd.Timestamp,
-) -> dict[str, Any] | None:
-    """Buy top N symbols by recent momentum, rotate monthly."""
-    df = _compute_indicators(df_raw)
-    start_idx, end_idx = _get_date_mask(df, start, end)
-    if start_idx is None:
-        return None
-
-    lookback = int(params.get("lookback", 20))
-    rebalance_freq = int(params.get("rebalance_freq", 20))  # bars between rebalances
-    top_n = int(params.get("top_n", 5))  # not used per-symbol, handled at portfolio level
-
-    close = df["Close"].to_numpy(dtype=float)
-    ret_col = f"Ret_{lookback}d"
-
-    capital = 100000.0
-    qty = 0
-    entry_price = 0.0
-    trades = 0
-    wins = 0
-    equity_curve: list[float] = []
-    holding_bars: list[int] = []
-    entry_idx: int | None = None
-    last_rebalance = start_idx
-
-    for i in range(start_idx, end_idx + 1):
-        price = close[i]
-        if np.isnan(price) or price <= 0:
-            if qty > 0:
-                capital += qty * max(close[max(0, i - 1)], 1.0)
-                qty = 0
-            equity_curve.append(capital)
-            continue
-
-        bars_since = i - last_rebalance
-
-        if qty == 0:
-            # Enter on rebalance: buy if momentum is positive
-            mom = df[ret_col].iloc[i] if ret_col in df.columns else 0
-            if bars_since >= rebalance_freq and not np.isnan(mom) and mom > 0:
-                invest = capital * 0.95
-                buy_qty = int(invest // price)
-                if buy_qty > 0:
-                    qty = buy_qty
-                    capital -= qty * price
-                    entry_price = price
-                    entry_idx = i
-                    trades += 1
-                    last_rebalance = i
-        else:
-            bars_held = i - entry_idx if entry_idx is not None else 0
-
-            # Exit on next rebalance
-            if bars_since >= rebalance_freq:
-                capital += qty * price
-                pnl = (price - entry_price) * qty
-                if price > entry_price:
-                    wins += 1
-                holding_bars.append(bars_held)
-                qty = 0
-                entry_price = 0.0
-                entry_idx = None
-                last_rebalance = i
-
-        equity_curve.append(capital + qty * price)
-
-    if qty > 0:
-        price = float(close[end_idx])
-        capital += qty * price
-        if price > entry_price:
-            wins += 1
-        if entry_idx is not None:
-            holding_bars.append(end_idx - entry_idx)
-
-    return _compute_metrics(equity_curve, trades, wins, holding_bars, start_idx, end_idx, df)
-
-
-# ── Strategy 5: Volatility Breakout ──────────────────────────────────────
-
-def _sim_vol_breakout(
-    df_raw: pd.DataFrame,
-    params: dict[str, Any],
-    start: pd.Timestamp,
-    end: pd.Timestamp,
-) -> dict[str, Any] | None:
-    """Range expansion breakout: enter when today's range > N * avg range."""
-    df = _compute_indicators(df_raw)
-    start_idx, end_idx = _get_date_mask(df, start, end)
-    if start_idx is None:
-        return None
-
-    range_mult = float(params.get("range_mult", 1.5))
-    atr_trail = float(params.get("atr_trail", 2.0))
-    max_hold = int(params.get("max_hold", 20))
-
-    close = df["Close"].to_numpy(dtype=float)
-    high = df["High"].to_numpy(dtype=float)
-    low = df["Low"].to_numpy(dtype=float)
-    range_pct = df["Range_pct"].to_numpy(dtype=float)
-    atr = df["ATR14"].to_numpy(dtype=float)
-    avg_range = df["ATR14"].to_numpy(dtype=float) / close  # approximate avg range %
-
-    capital = 100000.0
-    qty = 0
-    entry_price = 0.0
-    highest_since_entry = 0.0
-    trades = 0
-    wins = 0
-    equity_curve: list[float] = []
-    holding_bars: list[int] = []
-    entry_idx: int | None = None
-
-    for i in range(start_idx, end_idx + 1):
-        price = close[i]
-        if np.isnan(price) or price <= 0:
-            if qty > 0:
-                capital += qty * max(close[max(0, i - 1)], 1.0)
-                qty = 0
-            equity_curve.append(capital)
-            continue
-
-        if qty == 0:
-            rp = range_pct[i]
-            ar = avg_range[i]
-            if np.isnan(rp) or np.isnan(ar) or ar <= 0:
-                equity_curve.append(capital)
-                continue
-
-            # Entry: range expansion AND price closes near the high (bullish)
-            range_ok = rp > range_mult * ar
-            bullish = price > (high[i] + low[i]) / 2
-
-            if range_ok and bullish:
-                invest = capital * 0.95
-                buy_qty = int(invest // price)
-                if buy_qty > 0:
-                    qty = buy_qty
-                    capital -= qty * price
-                    entry_price = price
-                    entry_idx = i
-                    highest_since_entry = price
-                    trades += 1
-        else:
-            bars_held = i - entry_idx if entry_idx is not None else 0
-            if price > highest_since_entry:
-                highest_since_entry = price
-
-            trail_stop = highest_since_entry - atr_trail * atr[i]
-            exit_signal = not np.isnan(trail_stop) and price < trail_stop and bars_held > 3
-
-            if max_hold > 0 and bars_held >= max_hold:
-                exit_signal = True
-
-            if exit_signal:
-                capital += qty * price
-                pnl = (price - entry_price) * qty
-                if price > entry_price:
-                    wins += 1
-                holding_bars.append(bars_held)
-                qty = 0
-                entry_price = 0.0
-                entry_idx = None
-                highest_since_entry = 0.0
-
-        equity_curve.append(capital + qty * price)
-
-    if qty > 0:
-        price = float(close[end_idx])
-        capital += qty * price
-        if price > entry_price:
-            wins += 1
-        if entry_idx is not None:
-            holding_bars.append(end_idx - entry_idx)
-
-    return _compute_metrics(equity_curve, trades, wins, holding_bars, start_idx, end_idx, df)
-
-
-# ── Aggregation ──────────────────────────────────────────────────────────
-
-def _agg(rows: dict[str, dict[str, Any]]) -> dict[str, Any]:
-    if not rows:
-        return {"cagr_pct": 0, "max_drawdown_pct": 0, "trades": 0, "win_rate_pct": 0, "sharpe_ratio": 0, "active_symbols": 0, "profitable_symbols": 0, "symbols": 0, "total_return_pct": 0}
-    syms = len(rows)
-    total_start = 100000.0 * syms
-    total_final = sum(float(r["final_equity"]) for r in rows.values())
-    ret = (total_final / total_start - 1) * 100.0
-    trades = sum(int(r["trades"]) for r in rows.values())
-    wins = sum(int(r.get("wins", 0)) for r in rows.values())
-    active = sum(1 for r in rows.values() if int(r["trades"]) > 0)
-    prof = sum(1 for r in rows.values() if float(r["total_return_pct"]) > 0)
-    years = 5.0
-    cagr = ((total_final / total_start) ** (1.0 / years) - 1.0) * 100.0 if total_final > 0 else -100.0
-    return {
-        "symbols": syms,
-        "active_symbols": active,
-        "profitable_symbols": prof,
-        "trades": trades,
-        "win_rate_pct": round((wins / max(1, trades)) * 100.0, 2),
-        "total_return_pct": round(float(ret), 2),
-        "cagr_pct": round(float(cagr), 2),
-        "max_drawdown_pct": round(float(np.mean([float(r["max_drawdown_pct"]) for r in rows.values()])), 2),
-        "sharpe_ratio": round(float(np.mean([float(r["sharpe_ratio"]) for r in rows.values()])), 2),
-    }
-
-
-# ── Main ─────────────────────────────────────────────────────────────────
-
-def main() -> int:
+    best = max(qualified, key=lambda x: x.get("agg", {}).get("selection_score", -999))
+    return best
+
+
+def _build_grid(history, champion):
+    """Build tonight's parameter grid based on history and champion."""
+    combos = []
+
+    # 1. Always test baseline (control)
+    base_params = {**BASELINE, "enhancement": "baseline"}
+    combos.append(base_params)
+
+    # 2. Re-test champion if exists
+    if champion and champion.get("enhancement") != "baseline":
+        champ_params = champion.get("params", {})
+        champ_params = {k: v for k, v in champ_params.items() if k != "enhancement"}
+        combos.append({**BASELINE, **champ_params, "enhancement": f"champion_{champion['enhancement']}"})
+
+    # 3. Determine which enhancement ideas have been tested
+    tested_keys = set()
+    for h in history:
+        p = h.get("params", {})
+        # Create a key from non-baseline params
+        diff = {k: v for k, v in p.items() if k not in BASELINE or BASELINE.get(k) != v}
+        tested_keys.add(json.dumps(diff, sort_keys=True, default=str))
+
+    # 4. Pick enhancement ideas that haven't been tested yet
+    untested = []
+    for idea in ENHANCEMENT_IDEAS:
+        key = json.dumps(idea, sort_keys=True, default=str)
+        if key not in tested_keys:
+            untested.append(idea)
+
+    # 5. Add up to 20 new ideas tonight
+    random.seed(datetime.now().day)
+    random.shuffle(untested)
+    for idea in untested[:20]:
+        label = "_".join(f"{k}={v}" for k, v in sorted(idea.items()))
+        combos.append({**BASELINE, **idea, "enhancement": label})
+
+    # 6. If we have a champion, mutate around it
+    if champion and champion.get("enhancement") != "baseline":
+        champ = champion.get("params", {})
+        # Generate mutations of the champion's key params
+        for _ in range(10):
+            mutated = {**BASELINE, **champ}
+            # Randomly tweak one parameter
+            tweaks = [
+                ("blend_weight", [0.0, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4, 0.5]),
+                ("momentum_period", [21, 42, 63, 84]),
+                ("top_n", [5, 6, 8, 10, 12]),
+                ("rebalance_freq", ["W-FRI", "2W-FRI", "3W-FRI", "ME"]),
+                ("rsi_min", [0, 45, 50, 55]),
+                ("rsi_max", [70, 75, 80, 100]),
+            ]
+            k, vals = random.choice(tweaks)
+            mutated[k] = random.choice(vals)
+            mutated["enhancement"] = f"mutation_{k}={mutated[k]}"
+            # Dedup
+            key = json.dumps({k2: v2 for k2, v2 in mutated.items() if k2 != "enhancement"}, sort_keys=True, default=str)
+            if key not in tested_keys:
+                combos.append(mutated)
+                tested_keys.add(key)
+
+    # Deduplicate combos
+    seen = set()
+    unique = []
+    for c in combos:
+        key = json.dumps({k: v for k, v in c.items() if k != "enhancement"}, sort_keys=True, default=str)
+        if key not in seen:
+            seen.add(key)
+            unique.append(c)
+
+    return unique
+
+
+def main():
+    t0 = time.time()
+    lab_config = _load_lab_config()
+    consistency_config = lab_config["consistency"]
     print(f"[{datetime.now().strftime('%H:%M:%S')}] Loading data...")
-    data_map = ex._load_data()
-    if not data_map:
-        print("ERROR: No data loaded")
+    instruments = _load_instruments()
+
+    prices_raw, _ = lab_load_prices(HIST_DIR, min_rows=700, min_end_date="2026-04-17",
+                                     symbols=set(), max_symbols=0)
+    if prices_raw.empty:
+        print("ERROR: No price data")
         return 1
-    print(f"Loaded {len(data_map)} symbols")
 
-    # Determine date range
-    starts, ends = [], []
-    for df in data_map.values():
-        d = pd.to_datetime(df["Date"]).dt.tz_localize(None)
-        starts.append(d.min())
-        ends.append(d.max())
-    date_start = min(starts)
-    date_end = max(ends)
-    print(f"Date range: {date_start.date()} → {date_end.date()}")
+    prices = prices_raw.ffill(limit=3)
+    print(f"Loaded {len(prices.columns)} symbols, {len(prices)} days")
+    prices = _filter_universe(prices, instruments)
+    print(f"Universe: {len(prices.columns)} symbols")
 
-    # ── Parameter grids ──────────────────────────────────────────────
-    all_combos: list[dict[str, Any]] = []
+    # Read history and find champion
+    history = _read_history()
+    champion = _find_champion(history)
+    if champion:
+        print(f"Champion: {champion['enhancement']} (CAGR {champion['agg']['cagr_pct']:.1f}%, SelScore {champion['agg']['selection_score']:.1f})")
+    else:
+        print("No history — starting fresh exploration")
 
-    # 1. Trend Following
-    for ma_fast, ma_slow in [(10, 20), (20, 50), (50, 200)]:
-        for rsi_p in [14]:
-            for rsi_entry in [40, 50, 60]:
-                for atr_m in [2.0, 2.5]:
-                    all_combos.append({"family": "trend", "ma_fast": ma_fast, "ma_slow": ma_slow, "rsi_period": rsi_p, "rsi_entry": rsi_entry, "atr_mult": atr_m, "use_macd": False})
-    # Trend + MACD
-    for ma_fast, ma_slow in [(20, 50)]:
-        for rsi_entry in [50]:
-            for atr_m in [2.0]:
-                all_combos.append({"family": "trend", "ma_fast": ma_fast, "ma_slow": ma_slow, "rsi_period": 14, "rsi_entry": rsi_entry, "atr_mult": atr_m, "use_macd": True})
+    # Build grid
+    combos = _build_grid(history, champion)
+    print(f"Testing {len(combos)} combinations ({len(history)} past results in history)...")
 
-    # 2. Mean Reversion
-    for rsi_p in [7, 14]:
-        for rsi_os, rsi_ob in [(30, 70), (20, 80), (25, 75)]:
-            for use_bb in [True, False]:
-                for max_hold in [10, 20]:
-                    all_combos.append({"family": "mean_reversion", "rsi_period": rsi_p, "rsi_oversold": rsi_os, "rsi_overbought": rsi_ob, "use_bb": use_bb, "max_hold": max_hold})
+    results = []
+    baseline_result = None
+    for idx, params in enumerate(combos):
+        enh = params.get("enhancement", "unknown")
+        if (idx + 1) % 10 == 0 or idx == 0:
+            print(f"  [{idx + 1}/{len(combos)}] {enh} ({time.time()-t0:.0f}s)")
 
-    # 3. Breakout + ATR
-    for dc_p in [10, 20]:
-        for atr_t in [2.0, 2.5]:
-            for sma_p in [50, 100]:
-                all_combos.append({"family": "breakout", "dc_period": dc_p, "atr_trail": atr_t, "vol_mult": 1.0, "sma_period": sma_p})
+        agg = _simulate(prices, params, instruments, consistency_config)
+        if agg is None:
+            continue
 
-    # 4. Momentum Rotation
-    for lookback in [10, 20, 60]:
-        for rebalance in [10, 20]:
-            all_combos.append({"family": "momentum_rotation", "lookback": lookback, "rebalance_freq": rebalance, "top_n": 5})
+        is_base = enh == "baseline"
+        if is_base:
+            baseline_result = {"enhancement": enh, "params": {k: v for k, v in params.items() if k != "instruments"}, "agg": agg, "is_baseline": True}
 
-    # 5. Volatility Breakout
-    for range_m in [1.5, 2.0, 2.5]:
-        for atr_t in [2.0, 2.5]:
-            for max_h in [10, 20]:
-                all_combos.append({"family": "vol_breakout", "range_mult": range_m, "atr_trail": atr_t, "max_hold": max_h})
+        results.append({
+            "enhancement": enh,
+            "params": {k: v for k, v in params.items() if k not in ("instruments",)},
+            "agg": agg,
+            "is_baseline": is_base,
+            "run_date": datetime.now().strftime("%Y-%m-%d"),
+        })
 
-    print(f"Testing {len(all_combos)} parameter combinations across 5 strategy families...")
+    # Qualified strategies always outrank unqualified high-CAGR outliers.
+    results.sort(
+        key=lambda x: (x["agg"]["qualified"], x["agg"]["selection_score"]),
+        reverse=True,
+    )
 
-    results: list[dict[str, Any]] = []
-    for idx, params in enumerate(all_combos):
-        family = params["family"]
-        label = f"{family}_" + "_".join(f"{k}={v}" for k, v in params.items() if k != "family")
-        if (idx + 1) % 20 == 0 or idx == 0:
-            print(f"  [{idx + 1}/{len(all_combos)}] {label[:80]}...")
+    # Append to history
+    with open(HISTORY, "a") as f:
+        for r in results:
+            f.write(json.dumps(r, default=str) + "\n")
 
-        per_sym: dict[str, dict[str, Any]] = {}
-        for sym, df_raw in data_map.items():
-            r = _simulate(df_raw, params, date_start, date_end)
-            if r is not None:
-                per_sym[sym] = r
+    # Print results
+    base_cagr = baseline_result["agg"]["cagr_pct"] if baseline_result else 0
+    base_sel = baseline_result["agg"]["selection_score"] if baseline_result else 0
 
-        agg = _agg(per_sym)
-        results.append({"label": label, "family": family, "params": params, "agg": agg})
-
-    # Sort by CAGR
-    results.sort(key=lambda x: x["agg"]["cagr_pct"], reverse=True)
-
-    # Print top 30
-    print(f"\n{'─' * 110}")
-    print(f"{'Rank':<5} {'Family':<18} {'Label':<45} {'CAGR%':>8} {'MaxDD%':>8} {'Trades':>7} {'Win%':>7} {'Sharpe':>7}")
-    print(f"{'─' * 110}")
-    for i, r in enumerate(results[:30], 1):
+    print(f"\n{'='*155}")
+    print(f"{'Rank':<5} {'CAGR%':>8} {'MaxDD%':>8} {'Sharpe':>7} {'WorstY':>8} {'MedY':>8} {'Roll12':>8} {'Qual':>5} {'Score':>9} {'Enhancement':<50}")
+    print(f"{'='*155}")
+    for i, r in enumerate(results[:20], 1):
         a = r["agg"]
-        print(f"{i:<5} {r['family']:<18} {r['label'][:44]:<45} {a['cagr_pct']:>8.1f} {a['max_drawdown_pct']:>8.1f} {a['trades']:>7} {a['win_rate_pct']:>7.1f} {a['sharpe_ratio']:>7.2f}")
+        marker = " <- BASELINE" if r.get("is_baseline") else (" <- CHAMPION" if r["enhancement"].startswith("champion_") else "")
+        print(f"{i:<5} {a['cagr_pct']:>8.1f} {a['max_drawdown_pct']:>8.1f} {a['sharpe_ratio']:>7.2f} "
+              f"{a['worst_year_return_pct']:>8.1f} {a['median_year_return_pct']:>8.1f} "
+              f"{a['min_rolling_12m_return_pct']:>8.1f} {str(a['qualified']):>5} "
+              f"{a['selection_score']:>9.1f} {r['enhancement'][:49]}{marker}")
+        if not a["qualified"]:
+            print(f"      rejected: {', '.join(a['qualification_failures'])}")
 
-    # Family summary
-    print(f"\n{'─' * 80}")
-    print(f"{'Family':<20} {'Best CAGR%':>10} {'Best DD%':>10} {'Combos':>8}")
-    print(f"{'─' * 80}")
-    for family in ["trend", "mean_reversion", "breakout", "momentum_rotation", "vol_breakout"]:
-        fam_results = [r for r in results if r["family"] == family]
-        if fam_results:
-            best = fam_results[0]
-            print(f"{family:<20} {best['agg']['cagr_pct']:>10.1f} {best['agg']['max_drawdown_pct']:>10.1f} {len(fam_results):>8}")
+    # New champion? Unqualified strategies can never be promoted.
+    new_champ = results[0] if results and results[0]["agg"]["qualified"] else None
+    if new_champ and new_champ["agg"]["selection_score"] > base_sel:
+        print(f"\n*** NEW CONSISTENCY CHAMPION: {new_champ['enhancement']} ***")
+        print(f"    Worst year {new_champ['agg']['worst_year_return_pct']:.1f}% · median year {new_champ['agg']['median_year_return_pct']:.1f}%")
+        print(f"    Minimum rolling 12m {new_champ['agg']['min_rolling_12m_return_pct']:.1f}% · Sharpe {new_champ['agg']['sharpe_ratio']:.2f}")
+    elif not new_champ:
+        print("\n*** NO QUALIFIED CHAMPION — live baseline remains unchanged ***")
 
     # Write output
     output = {
         "generated_at": datetime.now().isoformat(),
-        "date_range": f"{date_start.date()} → {date_end.date()}",
-        "symbols_loaded": len(data_map),
-        "combinations_tested": len(all_combos),
+        "version": "v5.1_consistency_optimised",
+        "consistency_config": consistency_config,
+        "date_range": f"{prices.index[0].date()} -> {prices.index[-1].date()}",
+        "symbols_loaded": len(prices.columns),
+        "combinations_tested": len(combos),
+        "history_size": len(history),
+        "baseline_cagr": base_cagr,
+        "champion_before": champion["enhancement"] if champion else "none",
+        "champion_after": new_champ["enhancement"] if new_champ else "none",
         "results": results,
     }
-    OUTPUT.write_text(json.dumps(output, indent=2))
-    print(f"\nWrote {len(results)} results to {OUTPUT}")
-
+    OUTPUT.write_text(json.dumps(output, indent=2, default=str))
+    print(f"\nWrote {len(results)} results to {OUTPUT} ({time.time()-t0:.0f}s)")
+    print(f"History: {len(history)} -> {len(history) + len(results)} entries in {HISTORY}")
     return 0
-
 
 if __name__ == "__main__":
     sys.exit(main())

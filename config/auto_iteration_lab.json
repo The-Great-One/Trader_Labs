@@ -1,0 +1,24 @@
+{
+  "consistency": {
+    "min_complete_years": 3,
+    "min_trading_days_per_year": 200,
+    "min_year_return_pct": 10.0,
+    "min_sharpe_ratio": 1.0,
+    "min_cost_bps_for_champion": 10.0,
+    "max_drawdown_abs_pct": 35.0,
+    "max_year_to_median_ratio": 3.0,
+    "min_rolling_12m_return_pct": 0.0,
+    "rolling_year_days": 252,
+    "score_weights": {
+      "worst_year": 0.45,
+      "median_year": 0.3,
+      "sharpe": 5.0,
+      "rolling_12m_min": 0.15,
+      "drawdown": 0.15,
+      "annual_mad": 0.25,
+      "turnover": 1.0,
+      "outlier_excess": 0.5
+    },
+    "disqualification_penalty": 100.0
+  }
+}

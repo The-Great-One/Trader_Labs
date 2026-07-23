@@ -1,0 +1,90 @@
+from __future__ import annotations
+
+import pandas as pd
+
+from scripts.auto_iteration_lab import (
+    SCORING_VERSION,
+    _consistency_metrics,
+    _find_champion,
+    _load_lab_config,
+)
+
+
+def _daily_years(yearly_targets: dict[int, float], days: int = 252) -> pd.Series:
+    chunks = []
+    for year, target_pct in yearly_targets.items():
+        daily = (1.0 + target_pct / 100.0) ** (1.0 / days) - 1.0
+        idx = pd.bdate_range(f"{year}-01-01", periods=days)
+        chunks.append(pd.Series(daily, index=idx))
+    return pd.concat(chunks).sort_index()
+
+
+def test_smooth_returns_outrank_one_year_outlier() -> None:
+    cfg = _load_lab_config()["consistency"]
+    smooth = _consistency_metrics(
+        _daily_years({2021: 25, 2022: 28, 2023: 24, 2024: 30}),
+        sharpe=1.8,
+        max_drawdown_pct=-18,
+        avg_turnover=3,
+        cost_bps=10,
+        config=cfg,
+    )
+    outlier = _consistency_metrics(
+        _daily_years({2021: 12, 2022: 11, 2023: 300, 2024: 10}),
+        sharpe=0.7,
+        max_drawdown_pct=-28,
+        avg_turnover=4,
+        cost_bps=10,
+        config=cfg,
+    )
+    assert smooth["qualified"] is True
+    assert outlier["qualified"] is False
+    assert "year_outlier_ratio" in outlier["qualification_failures"]
+    assert smooth["selection_score"] > outlier["selection_score"]
+
+
+def test_partial_year_is_reported_but_not_used_for_qualification() -> None:
+    cfg = _load_lab_config()["consistency"]
+    complete = _daily_years({2022: 20, 2023: 22, 2024: 18})
+    partial_idx = pd.bdate_range("2025-01-01", periods=40)
+    partial = pd.Series(-0.002, index=partial_idx)
+    metrics = _consistency_metrics(
+        pd.concat([complete, partial]),
+        sharpe=1.5,
+        max_drawdown_pct=-20,
+        avg_turnover=2,
+        cost_bps=10,
+        config=cfg,
+    )
+    assert metrics["complete_years"] == [2022, 2023, 2024]
+    assert metrics["partial_years"] == [2025]
+    assert "2025" in metrics["calendar_year_returns"]
+    assert metrics["worst_year_return_pct"] > 0
+
+
+def test_champion_requires_qualification() -> None:
+    history = [
+        {"enhancement": "outlier", "agg": {"qualified": False, "selection_score": 999, "scoring_version": SCORING_VERSION}},
+        {"enhancement": "smooth", "agg": {"qualified": True, "selection_score": 20, "scoring_version": SCORING_VERSION}},
+    ]
+    assert _find_champion(history)["enhancement"] == "smooth"
+    assert _find_champion([history[0]]) is None
+
+
+def test_old_scoring_schema_cannot_supply_champion() -> None:
+    stale = {"enhancement": "stale", "agg": {"qualified": True, "selection_score": 999}}
+    assert _find_champion([stale]) is None
+
+
+def test_optimistic_transaction_cost_run_cannot_be_champion() -> None:
+    cfg = _load_lab_config()["consistency"]
+    metrics = _consistency_metrics(
+        _daily_years({2021: 25, 2022: 28, 2023: 24, 2024: 30}),
+        sharpe=1.8,
+        max_drawdown_pct=-18,
+        avg_turnover=3,
+        cost_bps=0,
+        config=cfg,
+    )
+    assert metrics["qualified"] is False
+    assert "optimistic_transaction_costs" in metrics["qualification_failures"]

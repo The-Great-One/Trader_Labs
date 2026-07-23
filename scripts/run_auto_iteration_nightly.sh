@@ -99,24 +99,41 @@ from pathlib import Path
 path = Path(sys.argv[1])
 data = json.loads(path.read_text())
 rows = data.get("results", [])[:5]
-print("🧪 Nightly Strategy Auto-Iteration Complete")
+print("🧪 Nightly Strategy Consistency Lab Complete")
 print(
     f"{data.get('symbols_loaded', 0)} symbols · "
     f"{data.get('combinations_tested', 0)} combinations · "
     f"{data.get('date_range', 'unknown range')}"
 )
+print(f"Champion: {data.get('champion_after', 'none')}")
 if not rows:
     print("\nNo ranked strategy results were produced.")
 else:
     print("\nTop strategies:")
     for index, row in enumerate(rows, 1):
         agg = row.get("agg", {})
+        name = row.get("enhancement") or row.get("label") or "unnamed"
+        qualified = "✅" if agg.get("qualified") else "❌"
         print(
-            f"{index}. {row.get('family', 'unknown')} — "
-            f"CAGR {float(agg.get('cagr_pct', 0)):+.1f}% · "
-            f"DD {float(agg.get('max_drawdown_pct', 0)):.1f}% · "
-            f"Sharpe {float(agg.get('sharpe_ratio', 0)):.2f}"
+            f"{index}. {qualified} {name} — "
+            f"worst year {float(agg.get('worst_year_return_pct') or 0):+.1f}% · "
+            f"median {float(agg.get('median_year_return_pct') or 0):+.1f}% · "
+            f"rolling 12m floor {float(agg.get('min_rolling_12m_return_pct') or 0):+.1f}% · "
+            f"Sharpe {float(agg.get('sharpe_ratio', 0)):.2f} · "
+            f"CAGR {float(agg.get('cagr_pct', 0)):+.1f}%"
         )
+        annual = agg.get("calendar_year_returns", {})
+        complete = set(agg.get("complete_years", []))
+        if annual:
+            rendered = " · ".join(
+                f"{year}{'' if int(year) in complete else '*'} {float(value):+.1f}%"
+                for year, value in sorted(annual.items())
+            )
+            print(f"   {rendered}")
+        failures = agg.get("qualification_failures", [])
+        if failures:
+            print(f"   Rejected: {', '.join(failures)}")
+    print("\n* partial calendar year; excluded from consistency qualification")
 PY
   touch "$DELIVERED_FILE"
 }
