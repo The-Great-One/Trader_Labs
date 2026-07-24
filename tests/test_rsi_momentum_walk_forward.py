@@ -12,7 +12,7 @@ def test_expanding_folds_are_ordered_non_overlapping_and_use_only_prior_training
     dates = pd.bdate_range("2020-01-01", "2025-12-31")
     folds = build_expanding_folds(
         dates,
-        min_train_years=3,
+        min_train_years=2,
         test_months=6,
         step_months=6,
         min_test_days=40,
@@ -22,6 +22,19 @@ def test_expanding_folds_are_ordered_non_overlapping_and_use_only_prior_training
         assert fold.train_end < fold.test_start <= fold.test_end
         if index:
             assert folds[index - 1].test_end < fold.test_start
+
+
+def test_final_short_fold_is_marked_partial() -> None:
+    dates = pd.bdate_range("2021-04-20", "2026-07-16")
+    folds = build_expanding_folds(
+        dates,
+        min_train_years=2,
+        test_months=6,
+        step_months=6,
+        min_test_days=40,
+    )
+    assert len([fold for fold in folds if not fold.is_partial]) == 6
+    assert folds[-1].is_partial is True
 
 
 def test_walk_forward_summary_requires_consistency_not_one_outlier_fold() -> None:

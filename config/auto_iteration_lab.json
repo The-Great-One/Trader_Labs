@@ -22,11 +22,11 @@
     "disqualification_penalty": 100.0
   },
   "walk_forward": {
-    "min_train_years": 3,
+    "min_train_years": 2,
     "test_months": 6,
     "step_months": 6,
     "min_test_days": 40,
-    "min_folds": 4,
+    "min_folds": 6,
     "min_worst_fold_return_pct": 0.0,
     "min_stitched_sharpe": 1.0,
     "max_stitched_drawdown_abs_pct": 35.0,

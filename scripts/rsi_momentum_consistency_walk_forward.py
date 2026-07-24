@@ -56,6 +56,7 @@ class FoldWindow:
     test_start: pd.Timestamp
     test_end: pd.Timestamp
     test_days: int
+    is_partial: bool
 
 
 @dataclass(frozen=True)
@@ -66,6 +67,7 @@ class FoldResult:
     test_start: str
     test_end: str
     test_days: int
+    is_partial: bool
     candidate_return_pct: float
     candidate_cagr_pct: float
     candidate_max_drawdown_pct: float
@@ -100,6 +102,7 @@ def build_expanding_folds(
     while test_cursor <= end:
         train_dates = ordered[ordered < test_cursor]
         intended_end = test_cursor + pd.DateOffset(months=test_months) - pd.Timedelta(days=1)
+        is_partial = intended_end > end
         test_dates = ordered[(ordered >= test_cursor) & (ordered <= min(intended_end, end))]
         if len(train_dates) == 0:
             break
@@ -112,6 +115,7 @@ def build_expanding_folds(
                     test_start=pd.Timestamp(test_dates[0]),
                     test_end=pd.Timestamp(test_dates[-1]),
                     test_days=len(test_dates),
+                    is_partial=is_partial,
                 )
             )
         test_cursor = test_cursor + pd.DateOffset(months=step_months)
@@ -280,6 +284,7 @@ def main() -> int:
             test_start=str(fold.test_start.date()),
             test_end=str(fold.test_end.date()),
             test_days=fold.test_days,
+            is_partial=fold.is_partial,
             candidate_return_pct=float(candidate_result["total_return_pct"]),
             candidate_cagr_pct=float(candidate_result["cagr_pct"]),
             candidate_max_drawdown_pct=float(candidate_result["max_drawdown_pct"]),
@@ -293,22 +298,25 @@ def main() -> int:
         )
         fold_results.append(row)
         print(
-            f"Fold {fold.fold}: {row.test_start}→{row.test_end} · "
+            f"Fold {fold.fold}{' (partial)' if row.is_partial else ''}: "
+            f"{row.test_start}→{row.test_end} · "
             f"candidate {row.candidate_return_pct:+.2f}% · "
             f"baseline {row.baseline_return_pct:+.2f}% · "
             f"DD {row.candidate_max_drawdown_pct:.2f}% · Sharpe {row.candidate_sharpe:.2f}"
         )
 
-    candidate_stitched = pd.concat(candidate_oos).sort_index()
-    baseline_stitched = pd.concat(baseline_oos).sort_index()
+    full_indexes = [index for index, fold in enumerate(folds) if not fold.is_partial]
+    candidate_stitched = pd.concat([candidate_oos[index] for index in full_indexes]).sort_index()
+    baseline_stitched = pd.concat([baseline_oos[index] for index in full_indexes]).sort_index()
     if candidate_stitched.index.has_duplicates or baseline_stitched.index.has_duplicates:
         raise RuntimeError("walk-forward test folds overlap")
 
     candidate_metrics = _stitched_metrics(candidate_stitched)
     baseline_metrics = _stitched_metrics(baseline_stitched)
+    full_results = [row for row in fold_results if not row.is_partial]
     summary = summarize_walk_forward(
-        [row.candidate_return_pct for row in fold_results],
-        [row.baseline_return_pct for row in fold_results],
+        [row.candidate_return_pct for row in full_results],
+        [row.baseline_return_pct for row in full_results],
         stitched_sharpe=float(candidate_metrics["sharpe_ratio"]),
         stitched_drawdown_pct=float(candidate_metrics["max_drawdown_pct"]),
         config=walk_config,
@@ -316,10 +324,11 @@ def main() -> int:
 
     payload = {
         "generated_at": datetime.now().isoformat(),
-        "validator_version": "v1_retrospective_expanding_walk_forward",
+        "validator_version": "v2_six_full_folds_plus_partial",
         "methodology": {
             "type": "expanding_train_fixed_non_overlapping_test",
             "signal_data_cutoff": "each fold is simulated with prices truncated at test_end",
+            "partial_fold_treatment": "reported descriptively and excluded from promotion gates",
             "selection_caveat": (
                 "The fixed champion was discovered using the full historical sample. "
                 "This validates causal signal stability but is not a genuinely unseen final holdout."
@@ -339,8 +348,8 @@ def main() -> int:
             "end": str(prices.index[-1].date()),
         },
         "folds": [asdict(row) for row in fold_results],
-        "candidate_stitched_oos": candidate_metrics,
-        "baseline_stitched_oos": baseline_metrics,
+        "candidate_stitched_full_folds": candidate_metrics,
+        "baseline_stitched_full_folds": baseline_metrics,
         "summary": summary,
         "verdict": "passed_retrospective_walk_forward" if summary["passed"] else "failed_walk_forward",
     }
@@ -348,8 +357,8 @@ def main() -> int:
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-    print("\nCandidate stitched OOS:", json.dumps(candidate_metrics, indent=2))
-    print("Baseline stitched OOS:", json.dumps(baseline_metrics, indent=2))
+    print("\nCandidate stitched full folds:", json.dumps(candidate_metrics, indent=2))
+    print("Baseline stitched full folds:", json.dumps(baseline_metrics, indent=2))
     print("Summary:", json.dumps(summary, indent=2))
     print(f"Verdict: {payload['verdict']}")
     print(f"Saved: {output}")
