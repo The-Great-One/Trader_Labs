@@ -304,7 +304,16 @@ def _filter_universe(prices, instruments, min_vol=50000, min_mcap=500.0):
     return prices[keep]
 
 
-def _simulate(prices, params, instruments, consistency_config):
+def _simulate(
+    prices,
+    params,
+    instruments,
+    consistency_config,
+    *,
+    evaluation_start=None,
+    evaluation_end=None,
+    include_daily_returns=False,
+):
     if prices.empty or len(prices) < 200:
         return None
 
@@ -468,10 +477,22 @@ def _simulate(prices, params, instruments, consistency_config):
     if not portfolio_returns:
         return None
 
-    rets = np.array(portfolio_returns)
+    return_series = pd.Series(
+        portfolio_returns,
+        index=pd.DatetimeIndex(portfolio_dates),
+        dtype=float,
+    ).sort_index()
+    if evaluation_start is not None:
+        return_series = return_series.loc[return_series.index >= pd.Timestamp(evaluation_start)]
+    if evaluation_end is not None:
+        return_series = return_series.loc[return_series.index <= pd.Timestamp(evaluation_end)]
+    if return_series.empty:
+        return None
+
+    rets = return_series.to_numpy()
     eq = np.cumprod(1 + rets)
     final = float(eq[-1])
-    days = len(portfolio_returns)
+    days = len(return_series)
     years = max(days / 252, 0.1)
     cagr = ((final) ** (1 / years) - 1) * 100 if final > 0 else -100.0
     peak = np.maximum.accumulate(eq)
@@ -480,7 +501,7 @@ def _simulate(prices, params, instruments, consistency_config):
 
     avg_turn = turnover_total / max(rebalance_count, 1)
     consistency = _consistency_metrics(
-        pd.Series(rets, index=pd.DatetimeIndex(portfolio_dates)),
+        return_series,
         sharpe=sharpe,
         max_drawdown_pct=-max_dd,
         avg_turnover=avg_turn,
@@ -488,7 +509,7 @@ def _simulate(prices, params, instruments, consistency_config):
         config=consistency_config,
     )
 
-    return {
+    result = {
         "total_return_pct": round((final-1)*100, 2),
         "cagr_pct": round(cagr, 2),
         "max_drawdown_pct": round(-max_dd, 2),
@@ -499,6 +520,11 @@ def _simulate(prices, params, instruments, consistency_config):
         "universe_size": len(prices.columns),
         **consistency,
     }
+    if include_daily_returns:
+        result["_daily_returns"] = {
+            str(date)[:10]: float(value) for date, value in return_series.items()
+        }
+    return result
 
 
 def _read_history():

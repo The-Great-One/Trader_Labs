@@ -7,6 +7,7 @@ from scripts.auto_iteration_lab import (
     _consistency_metrics,
     _find_champion,
     _load_lab_config,
+    _simulate,
 )
 
 
@@ -88,3 +89,42 @@ def test_optimistic_transaction_cost_run_cannot_be_champion() -> None:
     )
     assert metrics["qualified"] is False
     assert "optimistic_transaction_costs" in metrics["qualification_failures"]
+
+
+def test_simulation_can_return_a_leakage_safe_evaluation_slice() -> None:
+    dates = pd.bdate_range("2022-01-03", periods=520)
+    trend = pd.Series(range(len(dates)), index=dates, dtype=float)
+    prices = pd.DataFrame(
+        {
+            "AAA": 100 + trend * 0.20,
+            "BBB": 100 + trend * 0.15,
+            "CCC": 100 + trend * 0.10,
+        },
+        index=dates,
+    )
+    cfg = _load_lab_config()["consistency"]
+    start, end = dates[400], dates[480]
+    result = _simulate(
+        prices,
+        {
+            "rsi_periods": [10, 20, 30],
+            "momentum_period": 21,
+            "regime_mode": "none",
+            "use_macd": False,
+            "top_n": 2,
+            "rebalance_freq": "3W-FRI",
+            "cost_bps": 10.0,
+            "max_per_sector": 0,
+        },
+        pd.DataFrame(),
+        cfg,
+        evaluation_start=start,
+        evaluation_end=end,
+        include_daily_returns=True,
+    )
+    assert result is not None
+    daily = result.pop("_daily_returns")
+    observed = pd.DatetimeIndex(daily)
+    assert observed.min() >= start
+    assert observed.max() <= end
+    assert len(observed) == len(dates[(dates >= start) & (dates <= end)])

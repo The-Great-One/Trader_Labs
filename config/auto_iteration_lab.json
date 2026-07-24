@@ -20,5 +20,17 @@
       "outlier_excess": 0.5
     },
     "disqualification_penalty": 100.0
+  },
+  "walk_forward": {
+    "min_train_years": 3,
+    "test_months": 6,
+    "step_months": 6,
+    "min_test_days": 40,
+    "min_folds": 4,
+    "min_worst_fold_return_pct": 0.0,
+    "min_stitched_sharpe": 1.0,
+    "max_stitched_drawdown_abs_pct": 35.0,
+    "min_baseline_outperformance_ratio": 0.5,
+    "max_fold_to_median_ratio": 3.0
   }
 }
