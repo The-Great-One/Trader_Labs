@@ -11,13 +11,17 @@ EXIT_FILE="$RUN_DIR/current.exit"
 STARTED_FILE="$RUN_DIR/current.started"
 DELIVERED_FILE="$RUN_DIR/current.delivered"
 RESULT_FILE="$ROOT/reports/auto_iteration_latest.json"
+META_FILE="$RUN_DIR/current.json"
+LOCK_FILE="$RUN_DIR/nightly.lock"
+LOCK_COMMAND="${AT_FLOCK_COMMAND:-/usr/bin/flock}"
+SUPERVISOR="$ROOT/scripts/run_lab_worker.py"
 
 mkdir -p "$RUN_DIR"
 
 running_pid() {
-  if [[ -s "$PID_FILE" ]]; then
+  if [[ -s "$META_FILE" ]]; then
     local pid
-    pid="$(cat "$PID_FILE")"
+    pid="$($PYTHON -c 'import json,sys; print(json.load(open(sys.argv[1]))["pid"])' "$META_FILE" 2>/dev/null || true)"
     if [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null; then
       printf '%s' "$pid"
       return 0
@@ -45,19 +49,24 @@ start_run() {
     lab="$3"
     log_file="$4"
     exit_file="$5"
+    lock_command="$6"
+    lock_file="$7"
+    supervisor="$8"
+    metadata="$9"
+    run_id="${10}"
     cd "$root"
     set +e
     AUTOTRADER_ROOT=/home/ubuntu/Auto_Trader \
       AT_RESEARCH_MODE=1 \
       AT_LAB_PRECACHE=0 \
       AT_DISABLE_FILE_LOGGING=1 \
-      "$python" "$lab" >"$log_file" 2>&1
+      "$lock_command" -n "$lock_file" "$python" "$supervisor" run "$metadata" "$run_id" "$python" "$lab" >"$log_file" 2>&1
     rc=$?
     tmp="${exit_file}.tmp.$$"
     printf "%s\n" "$rc" > "$tmp"
     mv "$tmp" "$exit_file"
     exit "$rc"
-  ' _ "$ROOT" "$PYTHON" "$LAB" "$log_file" "$EXIT_FILE" </dev/null >/dev/null 2>&1 &
+  ' _ "$ROOT" "$PYTHON" "$LAB" "$log_file" "$EXIT_FILE" "$LOCK_COMMAND" "$LOCK_FILE" "$SUPERVISOR" "$META_FILE" "$run_id" </dev/null >/dev/null 2>&1 &
 
   pid=$!
   printf '%s\n' "$pid" > "$PID_FILE"
@@ -141,8 +150,8 @@ PY
 stop_run() {
   local pid
   if pid="$(running_pid)"; then
-    kill "$pid"
-    echo "Stopped nightly strategy auto-iteration (PID $pid)."
+    "$PYTHON" "$SUPERVISOR" stop "$META_FILE" || true
+    echo "Stopped nightly strategy auto-iteration process group (worker PID $pid)."
   else
     echo "Nightly strategy auto-iteration is not running."
   fi
