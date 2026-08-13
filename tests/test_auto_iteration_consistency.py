@@ -4,6 +4,7 @@ import pandas as pd
 
 from scripts.auto_iteration_lab import (
     SCORING_VERSION,
+    _apply_walk_forward_readiness,
     _consistency_metrics,
     _find_champion,
     _load_lab_config,
@@ -63,13 +64,19 @@ def test_partial_year_is_reported_but_not_used_for_qualification() -> None:
     assert metrics["worst_year_return_pct"] > 0
 
 
-def test_champion_requires_qualification() -> None:
+def test_champion_requires_walk_forward_readiness() -> None:
     history = [
         {"enhancement": "outlier", "agg": {"qualified": False, "selection_score": 999, "scoring_version": SCORING_VERSION}},
-        {"enhancement": "smooth", "agg": {"qualified": True, "selection_score": 20, "scoring_version": SCORING_VERSION}},
+        {"enhancement": "consistency_only", "agg": {"qualified": True, "selection_score": 50, "scoring_version": SCORING_VERSION}},
+        {
+            "enhancement": "ready",
+            "agg": {"qualified": True, "selection_score": 20, "scoring_version": SCORING_VERSION},
+            "champion_ready": True,
+            "walk_forward": {"qualified": True},
+        },
     ]
-    assert _find_champion(history)["enhancement"] == "smooth"
-    assert _find_champion([history[0]]) is None
+    assert _find_champion(history)["enhancement"] == "ready"
+    assert _find_champion(history[:2]) is None
 
 
 def test_old_scoring_schema_cannot_supply_champion() -> None:
@@ -128,3 +135,33 @@ def test_simulation_can_return_a_leakage_safe_evaluation_slice() -> None:
     assert observed.min() >= start
     assert observed.max() <= end
     assert len(observed) == len(dates[(dates >= start) & (dates <= end)])
+
+
+def test_full_history_winner_remains_retrospective_when_walk_forward_fails() -> None:
+    result = {
+        "enhancement": "full_history_winner",
+        "agg": {"qualified": True, "selection_score": 99.0},
+    }
+    updated = _apply_walk_forward_readiness(
+        result,
+        {
+            "qualified": False,
+            "failures": ["weak_worst_fold"],
+            "fold_count": 6,
+        },
+    )
+
+    assert updated["evidence_label"] == "retrospective_only"
+    assert updated["champion_ready"] is False
+    assert updated["walk_forward"]["failures"] == ["weak_worst_fold"]
+
+
+def test_only_consistency_and_walk_forward_qualified_result_is_champion_ready() -> None:
+    result = {"enhancement": "stable", "agg": {"qualified": True, "selection_score": 20.0}}
+    updated = _apply_walk_forward_readiness(
+        result,
+        {"qualified": True, "failures": [], "fold_count": 6},
+    )
+
+    assert updated["evidence_label"] == "champion_ready"
+    assert updated["champion_ready"] is True

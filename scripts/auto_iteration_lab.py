@@ -52,6 +52,7 @@ from scripts.portfolio_simulator import (  # noqa: E402
     PortfolioSimulator,
     SignalIntent,
 )
+from scripts.walk_forward import evaluate_walk_forward  # noqa: E402
 
 HIST_DIR = REPO / "intermediary_files" / "Hist_Data"
 OUTPUT = REPO / "reports" / "auto_iteration_latest.json"
@@ -717,6 +718,17 @@ def _simulate(
     return result
 
 
+def _apply_walk_forward_readiness(
+    result: dict[str, Any], evidence: dict[str, Any]
+) -> dict[str, Any]:
+    """Attach WF evidence; consistency alone can never imply readiness."""
+    result["walk_forward"] = evidence
+    ready = bool(result.get("agg", {}).get("qualified")) and bool(evidence.get("qualified"))
+    result["champion_ready"] = ready
+    result["evidence_label"] = "champion_ready" if ready else "retrospective_only"
+    return result
+
+
 def _read_history():
     """Read past results to find the champion."""
     if not HISTORY.exists():
@@ -731,12 +743,14 @@ def _read_history():
 
 
 def _find_champion(history):
-    """Return the best candidate that passes every consistency gate."""
+    """Return only a schema-current candidate with enforced WF readiness."""
     qualified = [
         entry
         for entry in history
         if entry.get("agg", {}).get("qualified") is True
         and entry.get("agg", {}).get("scoring_version") == SCORING_VERSION
+        and entry.get("champion_ready") is True
+        and entry.get("walk_forward", {}).get("qualified") is True
     ]
     if not qualified:
         return None
@@ -820,6 +834,7 @@ def main():
     t0 = time.time()
     lab_config = _load_lab_config()
     consistency_config = lab_config["consistency"]
+    walk_forward_config = lab_config.walk_forward
     execution_config = lab_config["execution"]
     print(f"[{datetime.now().strftime('%H:%M:%S')}] Loading data...")
     instruments = _load_instruments()
@@ -874,13 +889,23 @@ def main():
         if is_base:
             baseline_result = {"enhancement": enh, "params": {k: v for k, v in params.items() if k != "instruments"}, "agg": agg, "is_baseline": True}
 
-        results.append({
+        result = {
             "enhancement": enh,
             "params": {k: v for k, v in params.items() if k not in ("instruments",)},
             "agg": agg,
             "is_baseline": is_base,
             "run_date": datetime.now().strftime("%Y-%m-%d"),
-        })
+        }
+        evidence = evaluate_walk_forward(
+            prices,
+            candidate_params=params,
+            baseline_params=BASELINE,
+            instruments=instruments,
+            config=walk_forward_config,
+            execution_config=lab_config.execution,
+            intent_builder=build_signal_intents,
+        )
+        results.append(_apply_walk_forward_readiness(result, evidence))
 
     # Qualified strategies always outrank unqualified high-CAGR outliers.
     results.sort(
@@ -910,8 +935,8 @@ def main():
         if not a["qualified"]:
             print(f"      rejected: {', '.join(a['qualification_failures'])}")
 
-    # New champion? Unqualified strategies can never be promoted.
-    new_champ = results[0] if results and results[0]["agg"]["qualified"] else None
+    # A research champion requires consistency plus every walk-forward gate.
+    new_champ = next((result for result in results if result.get("champion_ready") is True), None)
     if new_champ and new_champ["agg"]["selection_score"] > base_sel:
         print(f"\n*** NEW CONSISTENCY CHAMPION: {new_champ['enhancement']} ***")
         print(f"    Worst year {new_champ['agg']['worst_year_return_pct']:.1f}% · median year {new_champ['agg']['median_year_return_pct']:.1f}%")
@@ -924,6 +949,8 @@ def main():
         "generated_at": datetime.now().isoformat(),
         "version": "v5.1_consistency_optimised",
         "consistency_config": consistency_config,
+        "walk_forward_config": asdict(walk_forward_config),
+        "walk_forward_evidence_note": "Retrospective fixed-candidate stability only; candidate discovery used full history.",
         "date_range": f"{closes.index[0].date()} -> {closes.index[-1].date()}",
         "symbols_loaded": len(closes.columns),
         "combinations_tested": len(combos),
