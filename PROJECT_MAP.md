@@ -1,13 +1,13 @@
 # Trader_Labs Project Map
 
-Trader_Labs has one intentionally small live closure: the nightly RSI-momentum auto-iteration lab and the observe-only Qlib tracker.
+Trader_Labs has one intentionally small live closure: the nightly RSI-momentum auto-iteration lab.
 
 ## Roots
 
 - Local: `/Users/sahilgoel/Desktop/Projects/trading/Trader_Labs`
 - Runtime: `/home/ubuntu/Trader_Labs`
 - Host: `ubuntu@144.24.112.62` (`arunnet`)
-- Runtime Python and live-rule dependency: `/home/ubuntu/Auto_Trader`
+- Runtime Python: `/home/ubuntu/Auto_Trader/venv/bin/python`
 
 ## Nightly auto-iteration flow
 
@@ -32,29 +32,11 @@ Outputs:
 - `reports/auto_iteration_history.jsonl`
 - `reports/auto_iteration_runs/`
 
-## Qlib tracker flow
-
-```text
-server cron: 15 12 * * 1-5
-→ scripts/qlib_rs_daily_tracker.py
-→ scripts/qlib_paper_overlay.py
-→ scripts/qlib_alpha_lab.py
-└→ Auto_Trader.RULE_SET_2, Auto_Trader.RULE_SET_7, Auto_Trader.utils
-```
-
-The chain is observe-only and places no orders. Outputs:
-
-- `reports/qlib_rs_daily_tracker_latest.json`
-- `reports/qlib_rs_daily_tracker_history.jsonl`
-
 ## Kept files
 
 - `scripts/__init__.py`
 - `scripts/auto_iteration_lab.py`
 - `scripts/rsi_224466_rotation_lab.py`
-- `scripts/qlib_rs_daily_tracker.py`
-- `scripts/qlib_paper_overlay.py`
-- `scripts/qlib_alpha_lab.py`
 - `scripts/run_auto_iteration_nightly.sh`
 - `config/auto_iteration_lab.json`
 
@@ -71,8 +53,7 @@ The chain is observe-only and places no orders. Outputs:
 ```bash
 # Syntax only; does not run the lab
 python3 -m py_compile scripts/__init__.py scripts/auto_iteration_lab.py \
-  scripts/rsi_224466_rotation_lab.py scripts/qlib_rs_daily_tracker.py \
-  scripts/qlib_paper_overlay.py scripts/qlib_alpha_lab.py
+  scripts/rsi_224466_rotation_lab.py
 
 # Lifecycle status; do not use start during routine verification
 scripts/run_auto_iteration_nightly.sh status
