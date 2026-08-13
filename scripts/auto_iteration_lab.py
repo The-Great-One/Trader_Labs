@@ -41,10 +41,15 @@ if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
 
 from scripts.rsi_224466_rotation_lab import (  # noqa: E402
-    load_prices as lab_load_prices,
+    load_ohlc_prices as lab_load_ohlc_prices,
     rebalance_dates as lab_rebalance_dates,
     rsi_dataframe as lab_rsi,
     build_regime_mask,
+)
+from scripts.portfolio_simulator import (  # noqa: E402
+    ExecutionDataError,
+    PortfolioSimulator,
+    SignalIntent,
 )
 
 HIST_DIR = REPO / "intermediary_files" / "Hist_Data"
@@ -308,6 +313,161 @@ def _filter_universe(prices, instruments, min_vol=50000, min_mcap=500.0):
     return prices[keep]
 
 
+def _prepare_close_inputs(
+    closes: pd.DataFrame, *, max_close_ffill_rows: int = 3
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Apply the sole close forward-fill and retain each mark's source date."""
+    ordered = closes.sort_index().copy()
+    sources = pd.DataFrame(index=ordered.index, columns=ordered.columns, dtype="datetime64[ns]")
+    for symbol in ordered.columns:
+        observed = ordered[symbol].notna()
+        sources.loc[observed, symbol] = ordered.index[observed]
+    return ordered.ffill(limit=max_close_ffill_rows), sources.ffill(limit=max_close_ffill_rows)
+
+
+def _select_target_weights(
+    date: pd.Timestamp,
+    *,
+    closes: pd.DataFrame,
+    score: pd.DataFrame,
+    momentum: pd.DataFrame,
+    regime: pd.DataFrame,
+    macd_filter: pd.DataFrame,
+    universe_mask: pd.Series,
+    params: dict[str, Any],
+    instruments: pd.DataFrame,
+    previous: set[str],
+) -> dict[str, float]:
+    if not bool(universe_mask.get(date, True)):
+        return {}
+    rsi_at = score.loc[date].copy()
+    combined = rsi_at.where(momentum.loc[date] > 0, 0)
+    combined = combined.where(regime.loc[date] > 0, 0)
+    combined = combined.where(macd_filter.loc[date] > 0, 0)
+    combined = combined.where(rsi_at >= float(params.get("rsi_min", 0)), 0)
+    combined = combined.where(rsi_at <= float(params.get("rsi_max", 100)), 0)
+    turnover_penalty = float(params.get("turnover_penalty", 0))
+    if turnover_penalty:
+        for symbol in previous:
+            if symbol in combined and combined[symbol] > 0:
+                combined[symbol] += turnover_penalty
+    ranked = combined.dropna().sort_values(ascending=False)
+    top_n = int(params.get("top_n", 8))
+    if params.get("dynamic_top_n", False):
+        top_n = max(3, min(top_n, int((combined > 0).sum()) // 5))
+    candidates = [symbol for symbol in ranked.index if ranked[symbol] > 0]
+    max_sector = int(params.get("max_per_sector", 3))
+    picks: list[str] = []
+    sector_counts: dict[str, int] = {}
+    for symbol in candidates:
+        sector = "Unknown"
+        if max_sector > 0 and not instruments.empty and "Symbol" in instruments:
+            match = instruments[instruments["Symbol"].astype(str).str.upper() == str(symbol).upper()]
+            if not match.empty:
+                sector = str(match.iloc[0].get("Sector", "Unknown"))
+            if sector_counts.get(sector, 0) >= max_sector:
+                continue
+        picks.append(symbol)
+        sector_counts[sector] = sector_counts.get(sector, 0) + 1
+        if len(picks) == top_n:
+            break
+    if not picks:
+        return {}
+    if not params.get("vol_weight", False):
+        return {symbol: 1.0 / len(picks) for symbol in picks}
+    lookback = int(params.get("vol_lookback", 20))
+    inverse: dict[str, float] = {}
+    for symbol in picks:
+        sample = closes.loc[:date, symbol].tail(lookback)
+        volatility = float(sample.pct_change(fill_method=None).std())
+        if not np.isfinite(volatility) or volatility <= 0:
+            volatility = 1e-9
+        inverse[symbol] = 1.0 / volatility
+    total = sum(inverse.values())
+    return {symbol: inverse[symbol] / total for symbol in picks}
+
+
+def build_signal_intents(
+    opens: pd.DataFrame,
+    closes: pd.DataFrame,
+    params: dict[str, Any],
+    instruments: pd.DataFrame,
+) -> list[SignalIntent]:
+    """Construct causal D-close target intents; opens are used only for the calendar."""
+    del opens  # execution prices are deliberately not visible to selection
+    rsi_periods = tuple(params.get("rsi_periods", [22, 44, 66]))
+    score = sum(lab_rsi(closes, period) for period in rsi_periods) / len(rsi_periods)
+    momentum = closes.pct_change(int(params.get("momentum_period", 63)), fill_method=None)
+    blend = float(params.get("blend_weight", 0.0))
+    if blend > 0:
+        score = (1 - blend) * score + blend * momentum.rank(axis=1, pct=True) * 100
+    if params.get("use_rsi_accel", False):
+        score = score + float(params.get("rsi_accel_weight", 0.15)) * score.diff(5)
+    mode = params.get("regime_mode", "sma100")
+    if mode == "none":
+        regime = (closes > 0).astype(float)
+    else:
+        window = int(str(mode).replace("sma", ""))
+        regime = (closes > closes.rolling(window, min_periods=window).mean()).astype(float)
+    if params.get("use_universe_regime", False):
+        universe_mask = build_regime_mask(closes, params.get("universe_regime_mode", "universe_sma100"))
+    else:
+        universe_mask = pd.Series(True, index=closes.index)
+    if params.get("use_macd", True):
+        fast = closes.ewm(span=12, min_periods=12).mean()
+        slow = closes.ewm(span=26, min_periods=26).mean()
+        line = fast - slow
+        macd_filter = (line > line.ewm(span=9, min_periods=9).mean()).astype(float)
+    else:
+        macd_filter = (closes > 0).astype(float)
+
+    rebalance = set(lab_rebalance_dates(closes.index, params.get("rebalance_freq", "3W-FRI")))
+    intents: list[SignalIntent] = []
+    target: dict[str, float] = {}
+    entry_closes: dict[str, float] = {}
+    dd_exit = float(params.get("dd_exit_pct", 0))
+    sequence = 0
+    for date in closes.index:
+        new_target: dict[str, float] | None = None
+        if date in rebalance:
+            new_target = _select_target_weights(
+                date, closes=closes, score=score, momentum=momentum, regime=regime,
+                macd_filter=macd_filter, universe_mask=universe_mask, params=params,
+                instruments=instruments, previous=set(target),
+            )
+        elif dd_exit < 0 and target:
+            exited = {
+                symbol for symbol in target
+                if symbol in entry_closes and np.isfinite(closes.loc[date, symbol])
+                and (float(closes.loc[date, symbol]) / entry_closes[symbol] - 1.0) * 100 < dd_exit
+            }
+            if exited:
+                new_target = {symbol: weight for symbol, weight in target.items() if symbol not in exited}
+        if new_target is None or new_target == target:
+            continue
+        sequence += 1
+        old = set(target)
+        target = new_target
+        for symbol in set(target) - old:
+            entry_closes[symbol] = float(closes.loc[date, symbol])
+        for symbol in old - set(target):
+            entry_closes.pop(symbol, None)
+        intents.append(SignalIntent(f"signal-{sequence}-{date.date()}", date, dict(target)))
+    return intents
+
+
+def _execution_failure(exc: ExecutionDataError) -> dict[str, Any]:
+    return {
+        "reason": exc.reason,
+        "signal_date": str(exc.signal_date.date()) if exc.signal_date is not None else None,
+        "execution_date": str(exc.execution_date.date()) if exc.execution_date is not None else None,
+        "valuation_date": str(exc.valuation_date.date()) if exc.valuation_date is not None else None,
+        "missing_symbols": list(exc.missing_symbols),
+        "coverage": exc.coverage,
+        "source_mark_age": exc.source_mark_age,
+    }
+
+
 def _simulate(
     prices,
     params,
@@ -317,217 +477,84 @@ def _simulate(
     evaluation_start=None,
     evaluation_end=None,
     include_daily_returns=False,
+    execution_config=None,
 ):
-    if prices.empty or len(prices) < 200:
-        return None
-
-    pf = prices.ffill(limit=3)
-    rsi_periods = tuple(params.get("rsi_periods", [22, 44, 66]))
-    score = sum(lab_rsi(pf, p) for p in rsi_periods) / len(rsi_periods)
-
-    mom_period = params.get("momentum_period", 63)
-    mom = pf.pct_change(mom_period, fill_method=None)
-
-    blend_w = params.get("blend_weight", 0.0)
-    if blend_w > 0:
-        mom_rank = mom.rank(axis=1, pct=True)
-        score = (1 - blend_w) * score + blend_w * (mom_rank * 100)
-
-    if params.get("use_rsi_accel", False):
-        rsi_roc = score.diff(5)
-        score = score + params.get("rsi_accel_weight", 0.15) * rsi_roc
-
-    regime_mode = params.get("regime_mode", "sma100")
-    if regime_mode == "none":
-        regime = (pf > 0).astype(float)
+    if isinstance(prices, dict):
+        opens = prices["open"].sort_index()
+        raw_closes = prices["close"].reindex(index=opens.index, columns=opens.columns)
     else:
-        rw = int(regime_mode.replace("sma", ""))
-        regime = (pf > pf.rolling(rw, min_periods=rw).mean()).astype(float)
-
-    if params.get("use_universe_regime", False):
-        uni_mask = build_regime_mask(pf, params.get("universe_regime_mode", "universe_sma100"))
-    else:
-        uni_mask = pd.Series(True, index=pf.index)
-
-    use_macd = params.get("use_macd", True)
-    if use_macd:
-        ema_f = pf.ewm(span=12, min_periods=12).mean()
-        ema_s = pf.ewm(span=26, min_periods=26).mean()
-        macd_line = ema_f - ema_s
-        macd_filter = (macd_line > macd_line.ewm(span=9, min_periods=9).mean()).astype(float)
-    else:
-        macd_filter = (pf > 0).astype(float)
-
-    rebalance_freq = params.get("rebalance_freq", "3W-FRI")
-    dates = lab_rebalance_dates(pf.index, rebalance_freq)
-    if len(dates) < 3:
+        # Compatibility for callers that have not yet migrated to explicit OHLC.
+        raw_closes = prices.sort_index()
+        opens = raw_closes.copy()
+    if raw_closes.empty or len(raw_closes) < 200:
         return None
-    actionable = [d for d in dates if pf.index.get_loc(d) + 1 < len(pf.index)]
-    if len(actionable) < 3:
-        return None
-
-    returns = pf.pct_change(fill_method=None).fillna(0)
-    cost_rate = params.get("cost_bps", 10.0) / 10000.0
-    top_n = params.get("top_n", 8)
-    max_sec = params.get("max_per_sector", 3)
-    rsi_min = params.get("rsi_min", 0)
-    rsi_max = params.get("rsi_max", 100)
-    vol_weight = params.get("vol_weight", False)
-    vol_lb = params.get("vol_lookback", 20)
-    dynamic_n = params.get("dynamic_top_n", False)
-    turnover_pen = params.get("turnover_penalty", 0)
-    dd_exit = params.get("dd_exit_pct", 0)
-    portfolio_returns = []
-    portfolio_dates = []
-    prev_picks = set()
-    turnover_total = 0.0
-    rebalance_count = 0
-    entry_prices = {}
-
-    for i, d in enumerate(actionable):
-        ed = actionable[i + 1] if i + 1 < len(actionable) else pf.index[-1]
-
-        in_market = uni_mask.loc[d] if d in uni_mask.index else True
-        if not in_market:
-            period_mask = (returns.index > d) & (returns.index <= ed)
-            portfolio_returns.extend([0.0] * period_mask.sum())
-            portfolio_dates.extend(returns.index[period_mask].tolist())
-            prev_picks = set()
-            continue
-
-        rsi_at = score.loc[d].copy()
-        mom_at = mom.loc[d].copy()
-        combined = rsi_at.where(mom_at > 0, 0)
-        if d in regime.index:
-            combined = combined.where(regime.loc[d] > 0, 0)
-        if use_macd and d in macd_filter.index:
-            combined = combined.where(macd_filter.loc[d] > 0, 0)
-        combined = combined.where(rsi_at >= rsi_min, 0)
-        combined = combined.where(rsi_at <= rsi_max, 0)
-
-        if turnover_pen > 0 and prev_picks:
-            for s in prev_picks:
-                if s in combined.index and combined[s] > 0:
-                    combined[s] += turnover_pen
-
-        scored = combined.dropna().sort_values(ascending=False)
-        n_bullish = int((combined > 0).sum())
-        current_n = max(3, min(top_n, n_bullish // 5)) if dynamic_n else top_n
-
-        raw_picks = [s for s in scored.index if scored[s] > 0][:current_n * 2]
-
-        if max_sec > 0 and not instruments.empty:
-            sc = {}
-            filtered = []
-            for p in raw_picks:
-                m = instruments[instruments["Symbol"].str.upper() == p]
-                sec = str(m.iloc[0].get("Sector", "Unknown")) if not m.empty else "Unknown"
-                if sc.get(sec, 0) < max_sec:
-                    filtered.append(p)
-                    sc[sec] = sc.get(sec, 0) + 1
-                if len(filtered) >= current_n:
-                    break
-            picks = filtered[:current_n]
-        else:
-            picks = raw_picks[:current_n]
-
-        if not picks:
-            period_mask = (returns.index > d) & (returns.index <= ed)
-            portfolio_returns.extend([0.0] * period_mask.sum())
-            portfolio_dates.extend(returns.index[period_mask].tolist())
-            prev_picks = set()
-            continue
-
-        rebalance_count += 1
-        new_picks = set(picks)
-        turnover_total += len(new_picks.symmetric_difference(prev_picks)) / 2
-
-        if vol_weight:
-            vols = {}
-            for s in picks:
-                col = pf[s].loc[:d].tail(vol_lb)
-                vols[s] = float(col.pct_change().std()) if len(col) > 5 else 1.0
-            iv = {s: 1.0 / (v + 1e-9) for s, v in vols.items()}
-            ti = sum(iv.values())
-            weights = {s: iv[s] / ti for s in picks}
-        else:
-            weights = {s: 1.0 / len(picks) for s in picks}
-
-        period_mask = (returns.index > d) & (returns.index <= ed)
-        period_days = returns.loc[period_mask]
-
-        n_buy = len(new_picks - prev_picks) if i > 0 else len(picks)
-        n_sell = len(prev_picks - new_picks) if i > 0 else 0
-        tc = (n_buy + n_sell) * cost_rate / 2
-
-        exited = set()
-        daily_rets = []
-        for idx_date in period_days.index:
-            active = [s for s in picks if s not in exited]
-            day_ret = sum(weights.get(s, 0) * (period_days.loc[idx_date, s] if s in period_days.columns else 0.0) for s in active)
-            if dd_exit < 0:
-                for s in list(active):
-                    px = pf.loc[idx_date, s] if s in pf.columns else None
-                    if px and not pd.isna(px) and s in entry_prices and entry_prices[s] > 0:
-                        if (px / entry_prices[s] - 1) * 100 < dd_exit:
-                            exited.add(s)
-            daily_rets.append(day_ret - (tc / max(len(period_days), 1)))
-
-        portfolio_returns.extend(daily_rets)
-        portfolio_dates.extend(period_days.index.tolist())
-        entry_prices = {s: float(pf.loc[d, s]) for s in picks if s in pf.columns}
-        prev_picks = new_picks
-
-    if not portfolio_returns:
-        return None
-
-    return_series = pd.Series(
-        portfolio_returns,
-        index=pd.DatetimeIndex(portfolio_dates),
-        dtype=float,
-    ).sort_index()
-    if evaluation_start is not None:
-        return_series = return_series.loc[return_series.index >= pd.Timestamp(evaluation_start)]
-    if evaluation_end is not None:
-        return_series = return_series.loc[return_series.index <= pd.Timestamp(evaluation_end)]
-    if return_series.empty:
-        return None
-
-    rets = return_series.to_numpy()
-    eq = np.cumprod(1 + rets)
-    final = float(eq[-1])
-    days = len(return_series)
-    years = max(days / 252, 0.1)
-    cagr = ((final) ** (1 / years) - 1) * 100 if final > 0 else -100.0
-    peak = np.maximum.accumulate(eq)
-    max_dd = float(np.max((peak - eq) / (peak + 1e-9) * 100))
-    sharpe = float(rets.mean() / (rets.std() + 1e-9) * np.sqrt(252)) if len(rets) > 20 else 0.0
-
-    avg_turn = turnover_total / max(rebalance_count, 1)
-    consistency = _consistency_metrics(
-        return_series,
-        sharpe=sharpe,
-        max_drawdown_pct=-max_dd,
-        avg_turnover=avg_turn,
-        cost_bps=float(params.get("cost_bps", 0.0)),
-        config=consistency_config,
+    execution_config = execution_config or {}
+    max_ffill = int(execution_config.get("max_close_ffill_rows", 3))
+    closes, source_dates = _prepare_close_inputs(raw_closes, max_close_ffill_rows=max_ffill)
+    intents = build_signal_intents(opens, closes, params, instruments)
+    simulator = PortfolioSimulator(
+        opens, closes, initial_cash=100_000.0, cost_bps=float(params.get("cost_bps", 10.0)),
+        min_execution_open_coverage=float(execution_config.get("min_execution_open_coverage", 0.0)),
+        min_held_close_coverage=float(execution_config.get("min_held_close_coverage", 1.0)),
+        max_close_ffill_rows=max_ffill, close_source_dates=source_dates,
     )
-
+    try:
+        simulation = simulator.run(intents)
+    except ExecutionDataError as exc:
+        failure = _execution_failure(exc)
+        return {
+            "qualified": False, "qualification_failures": [exc.reason],
+            "execution_failure": failure, "scoring_version": SCORING_VERSION,
+            "selection_score": -float(consistency_config.get("disqualification_penalty", 100.0)),
+            "accounting": {"traded_notional": 0.0, "fees": 0.0, "cash_final": 100_000.0,
+                           "avg_one_way_turnover": 0.0, "fills": 0},
+        }
+    returns = simulation.returns
+    if evaluation_start is not None:
+        returns = returns.loc[returns.index >= pd.Timestamp(evaluation_start)]
+    if evaluation_end is not None:
+        returns = returns.loc[returns.index <= pd.Timestamp(evaluation_end)]
+    if returns.empty:
+        return None
+    equity = (1.0 + returns).cumprod()
+    final = float(equity.iloc[-1])
+    years = max(len(returns) / 252.0, 0.1)
+    cagr = (final ** (1.0 / years) - 1.0) * 100 if final > 0 else -100.0
+    drawdown = equity / equity.cummax() - 1.0
+    max_dd = float(drawdown.min() * 100.0)
+    values = returns.to_numpy()
+    sharpe = float(values.mean() / (values.std() + 1e-9) * np.sqrt(252)) if len(values) > 20 else 0.0
+    events = simulation.execution_events
+    avg_turnover = float(np.mean([event.one_way_turnover for event in events])) if events else 0.0
+    consistency = _consistency_metrics(
+        returns, sharpe=sharpe, max_drawdown_pct=max_dd, avg_turnover=avg_turnover,
+        cost_bps=float(params.get("cost_bps", 0.0)), config=consistency_config,
+    )
     result = {
-        "total_return_pct": round((final-1)*100, 2),
-        "cagr_pct": round(cagr, 2),
-        "max_drawdown_pct": round(-max_dd, 2),
-        "sharpe_ratio": round(sharpe, 3),
-        "avg_turnover": round(avg_turn, 1),
-        "rebalance_count": rebalance_count,
-        "final_equity": round(final * 100000, 2),
-        "universe_size": len(prices.columns),
+        "total_return_pct": round((final - 1.0) * 100, 2), "cagr_pct": round(cagr, 2),
+        "max_drawdown_pct": round(max_dd, 2), "sharpe_ratio": round(sharpe, 3),
+        "avg_turnover": round(avg_turnover, 4), "rebalance_count": len(events),
+        "final_equity": round(float(simulation.nav.iloc[-1]), 2), "universe_size": len(closes.columns),
+        "accounting": {
+            "traded_notional": simulation.final_state.traded_notional,
+            "fees": simulation.final_state.cumulative_fees, "cash_final": simulation.final_state.cash,
+            "avg_one_way_turnover": avg_turnover,
+            "fills": sum(len(event.fills) for event in events),
+        },
         **consistency,
     }
     if include_daily_returns:
-        result["_daily_returns"] = {
-            str(date)[:10]: float(value) for date, value in return_series.items()
-        }
+        result["_daily_returns"] = {str(date)[:10]: float(value) for date, value in returns.items()}
+        result["_execution_events"] = [
+            {
+                "signal_id": event.signal_id, "signal_date": str(event.signal_date)[:10],
+                "execution_date": str(event.execution_date)[:10],
+                "pre_trade_nav": event.pre_trade_nav,
+                "traded_notional": event.gross_traded_notional, "fees": event.fees,
+                "one_way_turnover": event.one_way_turnover,
+                "fills": [fill.__dict__ for fill in event.fills],
+            } for event in events
+        ]
     return result
 
 
@@ -637,16 +664,18 @@ def main():
     print(f"[{datetime.now().strftime('%H:%M:%S')}] Loading data...")
     instruments = _load_instruments()
 
-    prices_raw, _ = lab_load_prices(HIST_DIR, min_rows=700, min_end_date="2026-07-01",
-                                     symbols=set(), max_symbols=0)
-    if prices_raw.empty:
+    ohlc_raw, _ = lab_load_ohlc_prices(HIST_DIR, min_rows=700, min_end_date="2026-07-01",
+                                       symbols=set(), max_symbols=0)
+    closes_raw = ohlc_raw["close"]
+    if closes_raw.empty:
         print("ERROR: No price data")
         return 1
 
-    prices = prices_raw.ffill(limit=3)
-    print(f"Loaded {len(prices.columns)} symbols, {len(prices)} days")
-    prices = _filter_universe(prices, instruments)
-    print(f"Universe: {len(prices.columns)} symbols")
+    closes = _filter_universe(closes_raw, instruments)
+    opens = ohlc_raw["open"].reindex(index=closes.index, columns=closes.columns)
+    prices = {"open": opens, "close": closes}
+    print(f"Loaded {len(closes.columns)} symbols, {len(closes)} days")
+    print(f"Universe: {len(closes.columns)} symbols")
 
     # Read history and find champion
     history = _read_history()
@@ -725,8 +754,8 @@ def main():
         "generated_at": datetime.now().isoformat(),
         "version": "v5.1_consistency_optimised",
         "consistency_config": consistency_config,
-        "date_range": f"{prices.index[0].date()} -> {prices.index[-1].date()}",
-        "symbols_loaded": len(prices.columns),
+        "date_range": f"{closes.index[0].date()} -> {closes.index[-1].date()}",
+        "symbols_loaded": len(closes.columns),
         "combinations_tested": len(combos),
         "history_size": len(history),
         "baseline_cagr": base_cagr,
