@@ -10,6 +10,9 @@ runtime lives.
       execution remains next-open or live-equivalent.
 - [ ] Baseline-current comparison included.
 - [ ] Walk-forward/OOS metrics included.
+- [ ] Full-history winner is labelled `retrospective_only`; only a candidate passing all configured gates is `champion_ready`.
+- [ ] Stateful D-close/D+1-open fills, explicit cash, actual-notional fees/turnover, and fail-closed OHLC diagnostics reviewed.
+- [ ] Legacy history is archived and excluded; result/history rows carry the same schema and run ID.
 - [ ] Drawdown/trade-count/regime impact reviewed.
 - [ ] Candidate patch into Auto_Trader is minimal and live-safe.
 - [ ] Verify Auto_Trader tests/import checks after applying.

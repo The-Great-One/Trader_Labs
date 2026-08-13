@@ -9,7 +9,7 @@ scripts/auto_iteration_lab.py
 └── scripts/rsi_224466_rotation_lab.py
 ```
 
-`scripts/__init__.py` makes the directory importable. `scripts/run_auto_iteration_nightly.sh` supplies the `start`, `status`, and `stop` lifecycle for the nightly lab.
+`scripts/portfolio_simulator.py` owns stateful D-close/D+1-open accounting. `scripts/walk_forward.py` owns fixed-candidate retrospective folds. `scripts/run_auto_iteration_nightly.sh` uses flock plus `run_lab_worker.py` for single admission and complete process-group lifecycle.
 
 ## Nightly auto-iteration
 
@@ -30,7 +30,9 @@ Qualification gates and scoring weights are read from `config/auto_iteration_lab
 - `reports/auto_iteration_history.jsonl`
 - `reports/auto_iteration_runs/`
 
-The history is append-only. Only candidates that pass the configured consistency gates can become the research champion; a research champion is not an automatic live promotion.
+Corrected history is current-schema-only and atomically rewritten; incompatible legacy rows are archived rather than ranked or deduplicated. Full-history winners are `retrospective_only`. Only candidates passing every consistency and walk-forward gate can be `champion_ready`, and even that remains retrospective evidence rather than automatic live promotion.
+
+Signals use D close and model fills only at a real D+1 open. Holdings and cash persist and drift; fees and turnover use actual modeled notional. Missing required opens or held-position marks fail the candidate closed.
 
 Lifecycle commands on the runtime server:
 
