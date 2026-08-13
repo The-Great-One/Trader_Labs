@@ -4,7 +4,32 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Mapping
 
+import numpy as np
 import pandas as pd
+
+
+class ExecutionDataError(ValueError):
+    """Typed fail-closed market-data diagnostic."""
+
+    def __init__(
+        self,
+        reason: str,
+        *,
+        signal_date: pd.Timestamp | None = None,
+        execution_date: pd.Timestamp | None = None,
+        valuation_date: pd.Timestamp | None = None,
+        missing_symbols: tuple[str, ...] = (),
+        coverage: float = 0.0,
+        source_mark_age: dict[str, int] | None = None,
+    ) -> None:
+        super().__init__(reason)
+        self.reason = reason
+        self.signal_date = signal_date
+        self.execution_date = execution_date
+        self.valuation_date = valuation_date
+        self.missing_symbols = missing_symbols
+        self.coverage = coverage
+        self.source_mark_age = source_mark_age or {}
 
 
 @dataclass(frozen=True)
@@ -78,11 +103,19 @@ class PortfolioSimulator:
         *,
         initial_cash: float,
         cost_bps: float = 0.0,
+        min_execution_open_coverage: float = 0.0,
+        min_held_close_coverage: float = 0.0,
+        max_close_ffill_rows: int = 0,
+        close_source_dates: pd.DataFrame | None = None,
     ) -> None:
         self.opens = opens.sort_index()
         self.closes = closes.reindex(index=self.opens.index, columns=self.opens.columns)
         self.initial_cash = float(initial_cash)
         self.cost_rate = float(cost_bps) / 10_000.0
+        self.min_execution_open_coverage = float(min_execution_open_coverage)
+        self.min_held_close_coverage = float(min_held_close_coverage)
+        self.max_close_ffill_rows = int(max_close_ffill_rows)
+        self.close_source_dates = close_source_dates.reindex_like(self.closes) if close_source_dates is not None else None
 
     def run(self, signals: list[SignalIntent]) -> SimulationResult:
         state = PortfolioState(cash=self.initial_cash)
@@ -99,8 +132,8 @@ class PortfolioSimulator:
         for date in self.opens.index:
             signal = by_execution.get(date)
             if signal is not None:
-                self._execute(state, signal, date)
-            valuation = self._mark(state, date)
+                self.execute_signal(state, signal, date)
+            valuation = self.mark_state(state, date)
             state.valuation_events.append(valuation)
             nav_values[date] = valuation.nav
 
@@ -115,8 +148,32 @@ class PortfolioSimulator:
             pending_signals=pending,
         )
 
-    def _execute(self, state: PortfolioState, signal: SignalIntent, date: pd.Timestamp) -> None:
+    def execute_signal(self, state: PortfolioState, signal: SignalIntent, date: pd.Timestamp) -> None:
+        if signal.signal_id in state.executed_signal_ids:
+            raise ExecutionDataError(
+                "duplicate_signal_id", signal_date=signal.signal_date, execution_date=date
+            )
         prices = self.opens.loc[date]
+        finite_positive = prices.map(lambda value: bool(np.isfinite(value) and value > 0))
+        coverage = float(finite_positive.mean()) if len(finite_positive) else 0.0
+        if coverage < self.min_execution_open_coverage:
+            raise ExecutionDataError(
+                "insufficient_execution_open_coverage",
+                signal_date=signal.signal_date,
+                execution_date=date,
+                missing_symbols=tuple(sorted(finite_positive.index[~finite_positive])),
+                coverage=coverage,
+            )
+        required = set(state.units) | set(signal.target_weights)
+        invalid_required = tuple(sorted(symbol for symbol in required if symbol not in prices or not finite_positive[symbol]))
+        if invalid_required:
+            raise ExecutionDataError(
+                "invalid_required_open",
+                signal_date=signal.signal_date,
+                execution_date=date,
+                missing_symbols=invalid_required,
+                coverage=coverage,
+            )
         pre_trade_nav = state.cash + sum(quantity * float(prices[symbol]) for symbol, quantity in state.units.items())
         target_notional = {symbol: pre_trade_nav * float(weight) for symbol, weight in signal.target_weights.items()}
         symbols = sorted(set(state.units) | set(target_notional))
@@ -166,8 +223,35 @@ class PortfolioSimulator:
         state.executed_signal_ids.add(signal.signal_id)
         state.execution_events.append(event)
 
-    def _mark(self, state: PortfolioState, date: pd.Timestamp) -> ValuationEvent:
-        marks = {symbol: float(self.closes.loc[date, symbol]) for symbol in state.units}
+    def mark_state(self, state: PortfolioState, date: pd.Timestamp) -> ValuationEvent:
+        row_position = self.closes.index.get_loc(date)
+        marks: dict[str, float] = {}
+        invalid: list[str] = []
+        ages: dict[str, int] = {}
+        for symbol in state.units:
+            value = self.closes.loc[date, symbol]
+            source_date = date if self.close_source_dates is None else self.close_source_dates.loc[date, symbol]
+            if pd.isna(source_date):
+                age = self.max_close_ffill_rows + 1
+            else:
+                source_position = self.closes.index.get_indexer([pd.Timestamp(source_date)])[0]
+                age = row_position - source_position if source_position >= 0 else self.max_close_ffill_rows + 1
+            ages[symbol] = int(age)
+            if not np.isfinite(value) or value <= 0 or age < 0 or age > self.max_close_ffill_rows:
+                invalid.append(symbol)
+            else:
+                marks[symbol] = float(value)
+        coverage = (len(state.units) - len(invalid)) / len(state.units) if state.units else 1.0
+        if invalid or coverage < self.min_held_close_coverage:
+            raise ExecutionDataError(
+                "insufficient_held_close_coverage"
+                if coverage < self.min_held_close_coverage
+                else "invalid_held_close",
+                valuation_date=date,
+                missing_symbols=tuple(sorted(invalid)),
+                coverage=coverage,
+                source_mark_age={symbol: ages[symbol] for symbol in invalid},
+            )
         nav = state.cash + sum(quantity * marks[symbol] for symbol, quantity in state.units.items())
         weights = {symbol: quantity * marks[symbol] / nav for symbol, quantity in state.units.items()} if nav else {}
         state.last_marks = marks
