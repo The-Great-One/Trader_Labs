@@ -54,7 +54,9 @@ CONFIG = REPO / "config" / "auto_iteration_lab.json"
 SCORING_VERSION = "v5.1_calendar_consistency"
 OUTPUT.parent.mkdir(exist_ok=True)
 
-# Live production baseline (must match cron env)
+# Live production baseline (must match cron env + deployed paper trader).
+# 2026-08: champion config (vol_weight, vol_lookback 10) promoted to live on
+# the RSI paper trader — the lab's baseline control must mirror deployment.
 BASELINE = {
     "rsi_periods": [22, 44, 66],
     "momentum_period": 63,
@@ -65,6 +67,8 @@ BASELINE = {
     "cost_bps": 10.0,
     "max_per_sector": 3,
     "blend_weight": 0.3,
+    "vol_weight": True,
+    "vol_lookback": 10,
 }
 
 
@@ -633,7 +637,7 @@ def main():
     print(f"[{datetime.now().strftime('%H:%M:%S')}] Loading data...")
     instruments = _load_instruments()
 
-    prices_raw, _ = lab_load_prices(HIST_DIR, min_rows=700, min_end_date="2026-04-17",
+    prices_raw, _ = lab_load_prices(HIST_DIR, min_rows=700, min_end_date="2026-07-01",
                                      symbols=set(), max_symbols=0)
     if prices_raw.empty:
         print("ERROR: No price data")
