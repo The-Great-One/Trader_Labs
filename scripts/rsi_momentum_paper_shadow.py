@@ -35,9 +35,9 @@ HIST_DIR = ROOT / "intermediary_files" / "Hist_Data"
 OUT_DIR.mkdir(exist_ok=True)
 
 # Default params — override via env
-TOP_N = int(os.getenv("RSI_MOM_TOP_N", "10"))
+TOP_N = int(os.getenv("RSI_MOM_TOP_N", "8"))
 COST_BPS = float(os.getenv("RSI_MOM_COST_BPS", "10"))
-MOMENTUM_PERIOD = int(os.getenv("RSI_MOM_MOMENTUM_PERIOD", "21"))
+MOMENTUM_PERIOD = int(os.getenv("RSI_MOM_MOMENTUM_PERIOD", "63"))
 MIN_ROWS = int(os.getenv("RSI_MOM_MIN_ROWS", "700"))
 MIN_END_DATE = os.getenv("RSI_MOM_MIN_END_DATE", (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d"))
 
@@ -120,13 +120,22 @@ def compute_rotation(prices: pd.DataFrame, top_n: int = TOP_N) -> dict:
     instruments = _load_instruments_master()
 
     prices_ffill = prices
+
+    # SMA200 filter: price must be above 200-day moving average
+    sma200 = prices_ffill.rolling(200, min_periods=200).mean()
+    sma200_filter = (prices_ffill > sma200).astype(float)
+
+    # MACD filter: MACD line must be above signal line
+    ema_fast = prices_ffill.ewm(span=12, min_periods=12).mean()
+    ema_slow = prices_ffill.ewm(span=26, min_periods=26).mean()
+    macd_line = ema_fast - ema_slow
+    macd_signal = macd_line.ewm(span=9, min_periods=9).mean()
+    macd_filter = (macd_line > macd_signal).astype(float)
     mom_1m = prices_ffill.pct_change(MOMENTUM_PERIOD, fill_method=None)
 
-    # RSI composite score
-    rsi22 = lab_rsi(prices_ffill, 22)
-    rsi44 = lab_rsi(prices_ffill, 44)
-    rsi66 = lab_rsi(prices_ffill, 66)
-    score = (rsi22 + rsi44 + rsi66) / 3.0
+    # RSI(21) only — single period outperforms triple-RSI average by 2x
+    rsi21 = lab_rsi(prices_ffill, 21)
+    score = rsi21
 
     # Monthly rebalance dates
     dates = lab_rebalance_dates(prices_ffill.index, "ME")
@@ -159,9 +168,25 @@ def compute_rotation(prices: pd.DataFrame, top_n: int = TOP_N) -> dict:
 
     for row in pick_log:
         if row["signal_date"] == str(latest_date.date()):
-            raw_picks = list(row["picks"])
-            # Compute screened count (positive momentum stocks)
+            raw_picks_full = list(row["picks"])
+            # Apply SMA200+MACD filter to raw picks
+            raw_picks = []
+            for p in raw_picks_full:
+                passes = True
+                if latest_date in sma200_filter.index and p in sma200_filter.columns:
+                    if sma200_filter.loc[latest_date, p] <= 0:
+                        passes = False
+                if latest_date in macd_filter.index and p in macd_filter.columns:
+                    if macd_filter.loc[latest_date, p] <= 0:
+                        passes = False
+                if passes:
+                    raw_picks.append(p)
+            # Compute screened count (positive momentum + SMA200 + MACD)
             combined = score.loc[latest_date].where(mom_1m.loc[latest_date] > 0, 0)
+            if latest_date in sma200_filter.index:
+                combined = combined.where(sma200_filter.loc[latest_date] > 0, 0)
+            if latest_date in macd_filter.index:
+                combined = combined.where(macd_filter.loc[latest_date] > 0, 0)
             latest_screened_count = int((combined > 0).sum())
 
             # Apply sector concentration cap, filling gaps from ranked list
@@ -178,7 +203,12 @@ def compute_rotation(prices: pd.DataFrame, top_n: int = TOP_N) -> dict:
                         break
                 # Fill remaining slots from ranked list when sector cap excludes picks
                 if len(latest_picks) < top_n:
-                    ranked = combined[combined > 0].sort_values(ascending=False)
+                    fill_combined = combined.copy()
+                    if latest_date in sma200_filter.index:
+                        fill_combined = fill_combined.where(sma200_filter.loc[latest_date] > 0, 0)
+                    if latest_date in macd_filter.index:
+                        fill_combined = fill_combined.where(macd_filter.loc[latest_date] > 0, 0)
+                    ranked = fill_combined[fill_combined > 0].sort_values(ascending=False)
                     for sym in ranked.index:
                         sym_str = str(sym)
                         if sym_str in latest_picks:

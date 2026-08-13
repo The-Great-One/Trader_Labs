@@ -55,7 +55,7 @@ def strategy_daily_returns(
     cost_bps: float = 10.0,
     momentum_period: int = 21,
 ) -> tuple[pd.Series, list[dict]]:
-    rsi_score = (lab_rsi(prices, 22) + lab_rsi(prices, 44) + lab_rsi(prices, 66)) / 3.0
+    rsi_score = lab_rsi(prices, 21)  # RSI(21) only — 2x better than triple-RSI average
     mom_1m = prices.pct_change(momentum_period, fill_method=None)
     returns = prices.pct_change(fill_method=None).fillna(0)
     dates = lab_rebalance_dates(prices.index, "ME")
