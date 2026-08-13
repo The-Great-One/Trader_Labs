@@ -49,6 +49,10 @@ if str(AUTOTRADER_ROOT) in sys.path:
     sys.path.remove(str(AUTOTRADER_ROOT))
 sys.path.insert(0, str(AUTOTRADER_ROOT))
 
+# Auto_Trader/utils.py gates retired broker/news/database imports behind
+# AT_RESEARCH_MODE; this tracker only needs Indicators + the legacy rules.
+os.environ.setdefault("AT_RESEARCH_MODE", "1")
+
 from Auto_Trader import RULE_SET_2, RULE_SET_7
 from Auto_Trader import utils as at_utils
 
