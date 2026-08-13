@@ -53,6 +53,12 @@ from scripts.portfolio_simulator import (  # noqa: E402
     SignalIntent,
 )
 from scripts.walk_forward import evaluate_walk_forward  # noqa: E402
+from scripts.lab_schema import (  # noqa: E402
+    RESULT_SCHEMA_VERSION,
+    STRATEGY_DEFAULTS,
+    canonical_params,
+    params_fingerprint,
+)
 
 HIST_DIR = REPO / "intermediary_files" / "Hist_Data"
 OUTPUT = REPO / "reports" / "auto_iteration_latest.json"
@@ -64,19 +70,7 @@ OUTPUT.parent.mkdir(exist_ok=True)
 # Live production baseline (must match cron env + deployed paper trader).
 # 2026-08: champion config (vol_weight, vol_lookback 10) promoted to live on
 # the RSI paper trader — the lab's baseline control must mirror deployment.
-BASELINE = {
-    "rsi_periods": [22, 44, 66],
-    "momentum_period": 63,
-    "regime_mode": "sma100",
-    "use_macd": True,
-    "top_n": 8,
-    "rebalance_freq": "3W-FRI",
-    "cost_bps": 10.0,
-    "max_per_sector": 3,
-    "blend_weight": 0.3,
-    "vol_weight": True,
-    "vol_lookback": 10,
-}
+BASELINE = canonical_params(STRATEGY_DEFAULTS)
 
 
 class ConfigError(ValueError):
@@ -747,60 +741,57 @@ def _find_champion(history):
     qualified = [
         entry
         for entry in history
-        if entry.get("agg", {}).get("qualified") is True
+        if entry.get("schema_version") == RESULT_SCHEMA_VERSION
+        and entry.get("agg", {}).get("qualified") is True
         and entry.get("agg", {}).get("scoring_version") == SCORING_VERSION
         and entry.get("champion_ready") is True
         and entry.get("walk_forward", {}).get("qualified") is True
+        and entry.get("params_fingerprint") == params_fingerprint(entry.get("params", {}))
     ]
     if not qualified:
         return None
-    best = max(qualified, key=lambda x: x.get("agg", {}).get("selection_score", -999))
-    return best
+    return max(qualified, key=lambda x: x.get("agg", {}).get("selection_score", -999))
+
+
+def _grid_entry(params: dict[str, Any], label: str, role: str) -> dict[str, Any]:
+    canonical = canonical_params(params)
+    return {
+        **canonical,
+        "enhancement": label,
+        "retest_role": role,
+        "params_fingerprint": params_fingerprint(canonical),
+    }
 
 
 def _build_grid(history, champion):
-    """Build tonight's parameter grid based on history and champion."""
-    combos = []
+    """Build a fingerprint-deduplicated grid from current-schema history."""
+    history_fingerprints = {
+        entry.get("params_fingerprint")
+        for entry in history
+        if entry.get("schema_version") == RESULT_SCHEMA_VERSION
+    }
+    combos = [_grid_entry(BASELINE, "baseline", "baseline")]
 
-    # 1. Always test baseline (control)
-    base_params = {**BASELINE, "enhancement": "baseline"}
-    combos.append(base_params)
+    incumbent_params = champion.get("params", {}) if champion else None
+    if incumbent_params is not None:
+        combos.append(_grid_entry(incumbent_params, f"champion_{champion['enhancement']}", "incumbent"))
 
-    # 2. Re-test champion if exists
-    if champion and champion.get("enhancement") != "baseline":
-        champ_params = champion.get("params", {})
-        champ_params = {k: v for k, v in champ_params.items() if k != "enhancement"}
-        combos.append({**BASELINE, **champ_params, "enhancement": f"champion_{champion['enhancement']}"})
-
-    # 3. Determine which enhancement ideas have been tested
-    tested_keys = set()
-    for h in history:
-        p = h.get("params", {})
-        # Create a key from non-baseline params
-        diff = {k: v for k, v in p.items() if k not in BASELINE or BASELINE.get(k) != v}
-        tested_keys.add(json.dumps(diff, sort_keys=True, default=str))
-
-    # 4. Pick enhancement ideas that haven't been tested yet
     untested = []
     for idea in ENHANCEMENT_IDEAS:
-        key = json.dumps(idea, sort_keys=True, default=str)
-        if key not in tested_keys:
-            untested.append(idea)
+        candidate = _grid_entry({**BASELINE, **idea}, "", "challenger")
+        if candidate["params_fingerprint"] not in history_fingerprints:
+            untested.append((idea, candidate))
 
-    # 5. Add up to 20 new ideas tonight
     random.seed(datetime.now().day)
     random.shuffle(untested)
-    for idea in untested[:20]:
-        label = "_".join(f"{k}={v}" for k, v in sorted(idea.items()))
-        combos.append({**BASELINE, **idea, "enhancement": label})
+    for idea, candidate in untested[:20]:
+        candidate["enhancement"] = "_".join(f"{key}={value}" for key, value in sorted(idea.items()))
+        combos.append(candidate)
 
-    # 6. If we have a champion, mutate around it
-    if champion and champion.get("enhancement") != "baseline":
-        champ = champion.get("params", {})
-        # Generate mutations of the champion's key params
+    if champion:
+        champ = canonical_params(champion.get("params", {}))
         for _ in range(10):
-            mutated = {**BASELINE, **champ}
-            # Randomly tweak one parameter
+            mutated = dict(champ)
             tweaks = [
                 ("blend_weight", [0.0, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4, 0.5]),
                 ("momentum_period", [21, 42, 63, 84]),
@@ -809,25 +800,42 @@ def _build_grid(history, champion):
                 ("rsi_min", [0, 45, 50, 55]),
                 ("rsi_max", [70, 75, 80, 100]),
             ]
-            k, vals = random.choice(tweaks)
-            mutated[k] = random.choice(vals)
-            mutated["enhancement"] = f"mutation_{k}={mutated[k]}"
-            # Dedup
-            key = json.dumps({k2: v2 for k2, v2 in mutated.items() if k2 != "enhancement"}, sort_keys=True, default=str)
-            if key not in tested_keys:
-                combos.append(mutated)
-                tested_keys.add(key)
+            key, values = random.choice(tweaks)
+            mutated[key] = random.choice(values)
+            candidate = _grid_entry(mutated, f"mutation_{key}={mutated[key]}", "challenger")
+            if candidate["params_fingerprint"] not in history_fingerprints:
+                combos.append(candidate)
 
-    # Deduplicate combos
-    seen = set()
+    seen: set[str] = set()
     unique = []
-    for c in combos:
-        key = json.dumps({k: v for k, v in c.items() if k != "enhancement"}, sort_keys=True, default=str)
-        if key not in seen:
-            seen.add(key)
-            unique.append(c)
-
+    for combo in combos:
+        fingerprint = combo["params_fingerprint"]
+        if fingerprint not in seen:
+            seen.add(fingerprint)
+            unique.append(combo)
     return unique
+
+
+def _classify_novelty(results, history) -> dict[str, int]:
+    historical = {entry.get("params_fingerprint") for entry in history}
+    counts = {"novel_configs": 0, "intentional_retests": 0, "accidental_retests": 0}
+    for result in results:
+        if result.get("params_fingerprint") not in historical:
+            counts["novel_configs"] += 1
+        elif result.get("retest_role") in {"baseline", "incumbent"}:
+            counts["intentional_retests"] += 1
+        else:
+            counts["accidental_retests"] += 1
+    return counts
+
+
+def _choose_champion_after(incumbent, challengers):
+    """Keep the best currently ready strategy evaluated on this snapshot."""
+    candidates = [incumbent, *challengers]
+    ready = [candidate for candidate in candidates if candidate and candidate.get("champion_ready") is True]
+    if not ready:
+        return None
+    return max(ready, key=lambda item: item.get("agg", {}).get("selection_score", -999))
 
 
 def main():
@@ -866,18 +874,23 @@ def main():
 
     results = []
     baseline_result = None
+    incumbent_result = None
+    incumbent_fingerprint = champion.get("params_fingerprint") if champion else None
     for idx, params in enumerate(combos):
         enh = params.get("enhancement", "unknown")
+        fingerprint = params["params_fingerprint"]
+        retest_role = params["retest_role"]
+        strategy_params = canonical_params(params)
         if (idx + 1) % 10 == 0 or idx == 0:
             print(f"  [{idx + 1}/{len(combos)}] {enh} ({time.time()-t0:.0f}s)")
 
-        if params.get("rebalance_freq") not in execution_config["allowed_rebalance_frequencies"]:
+        if strategy_params.get("rebalance_freq") not in execution_config["allowed_rebalance_frequencies"]:
             raise ConfigError(
-                f"strategy rebalance_freq {params.get('rebalance_freq')!r} is not allowed"
+                f"strategy rebalance_freq {strategy_params.get('rebalance_freq')!r} is not allowed"
             )
         agg = _simulate(
             prices,
-            params,
+            strategy_params,
             instruments,
             consistency_config,
             execution_config=execution_config,
@@ -885,27 +898,32 @@ def main():
         if agg is None:
             continue
 
-        is_base = enh == "baseline"
-        if is_base:
-            baseline_result = {"enhancement": enh, "params": {k: v for k, v in params.items() if k != "instruments"}, "agg": agg, "is_baseline": True}
-
+        is_base = retest_role == "baseline"
         result = {
+            "schema_version": RESULT_SCHEMA_VERSION,
             "enhancement": enh,
-            "params": {k: v for k, v in params.items() if k not in ("instruments",)},
+            "params": strategy_params,
+            "params_fingerprint": fingerprint,
+            "retest_role": retest_role,
             "agg": agg,
             "is_baseline": is_base,
             "run_date": datetime.now().strftime("%Y-%m-%d"),
         }
         evidence = evaluate_walk_forward(
             prices,
-            candidate_params=params,
+            candidate_params=strategy_params,
             baseline_params=BASELINE,
             instruments=instruments,
             config=walk_forward_config,
             execution_config=lab_config.execution,
             intent_builder=build_signal_intents,
         )
-        results.append(_apply_walk_forward_readiness(result, evidence))
+        evaluated = _apply_walk_forward_readiness(result, evidence)
+        if is_base:
+            baseline_result = evaluated
+        if incumbent_fingerprint and fingerprint == incumbent_fingerprint:
+            incumbent_result = evaluated
+        results.append(evaluated)
 
     # Qualified strategies always outrank unqualified high-CAGR outliers.
     results.sort(
@@ -935,9 +953,11 @@ def main():
         if not a["qualified"]:
             print(f"      rejected: {', '.join(a['qualification_failures'])}")
 
-    # A research champion requires consistency plus every walk-forward gate.
-    new_champ = next((result for result in results if result.get("champion_ready") is True), None)
-    if new_champ and new_champ["agg"]["selection_score"] > base_sel:
+    # A ready challenger must beat the same-snapshot re-evaluated incumbent.
+    challengers = [result for result in results if result is not incumbent_result]
+    new_champ = _choose_champion_after(incumbent_result, challengers)
+    novelty = _classify_novelty(results, history)
+    if new_champ and new_champ is not incumbent_result and new_champ["agg"]["selection_score"] > base_sel:
         print(f"\n*** NEW CONSISTENCY CHAMPION: {new_champ['enhancement']} ***")
         print(f"    Worst year {new_champ['agg']['worst_year_return_pct']:.1f}% · median year {new_champ['agg']['median_year_return_pct']:.1f}%")
         print(f"    Minimum rolling 12m {new_champ['agg']['min_rolling_12m_return_pct']:.1f}% · Sharpe {new_champ['agg']['sharpe_ratio']:.2f}")
@@ -947,6 +967,7 @@ def main():
     # Write output
     output = {
         "generated_at": datetime.now().isoformat(),
+        "schema_version": RESULT_SCHEMA_VERSION,
         "version": "v5.1_consistency_optimised",
         "consistency_config": consistency_config,
         "walk_forward_config": asdict(walk_forward_config),
@@ -955,6 +976,7 @@ def main():
         "symbols_loaded": len(closes.columns),
         "combinations_tested": len(combos),
         "history_size": len(history),
+        **novelty,
         "baseline_cagr": base_cagr,
         "champion_before": champion["enhancement"] if champion else "none",
         "champion_after": new_champ["enhancement"] if new_champ else "none",

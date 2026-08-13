@@ -1,10 +1,22 @@
 from __future__ import annotations
 
+import sys
+from pathlib import Path
+
 import pandas as pd
 
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from scripts.lab_schema import params_fingerprint
 from scripts.auto_iteration_lab import (
+    RESULT_SCHEMA_VERSION,
     SCORING_VERSION,
     _apply_walk_forward_readiness,
+    _build_grid,
+    _choose_champion_after,
+    _classify_novelty,
     _consistency_metrics,
     _find_champion,
     _load_lab_config,
@@ -69,7 +81,10 @@ def test_champion_requires_walk_forward_readiness() -> None:
         {"enhancement": "outlier", "agg": {"qualified": False, "selection_score": 999, "scoring_version": SCORING_VERSION}},
         {"enhancement": "consistency_only", "agg": {"qualified": True, "selection_score": 50, "scoring_version": SCORING_VERSION}},
         {
+            "schema_version": RESULT_SCHEMA_VERSION,
             "enhancement": "ready",
+            "params": {},
+            "params_fingerprint": __import__("scripts.lab_schema", fromlist=["params_fingerprint"]).params_fingerprint({}),
             "agg": {"qualified": True, "selection_score": 20, "scoring_version": SCORING_VERSION},
             "champion_ready": True,
             "walk_forward": {"qualified": True},
@@ -165,3 +180,55 @@ def test_only_consistency_and_walk_forward_qualified_result_is_champion_ready() 
 
     assert updated["evidence_label"] == "champion_ready"
     assert updated["champion_ready"] is True
+
+
+def _ready_result(label: str, score: float, *, ready: bool = True) -> dict:
+    return {
+        "schema_version": RESULT_SCHEMA_VERSION,
+        "enhancement": label,
+        "params": {"top_n": 8},
+        "params_fingerprint": "sha256:same",
+        "agg": {"qualified": ready, "selection_score": score, "scoring_version": SCORING_VERSION},
+        "walk_forward": {"qualified": ready},
+        "champion_ready": ready,
+    }
+
+
+def test_grid_deduplicates_equivalent_configs_with_different_labels() -> None:
+    champion = _ready_result("old", 20.0)
+    champion["params"] = {"top_n": 8, "enhancement": "old"}
+    grid = _build_grid([], champion)
+    fingerprints = [item["params_fingerprint"] for item in grid]
+    assert len(fingerprints) == len(set(fingerprints))
+
+
+def test_novelty_counts_separate_intentional_and_accidental_retests() -> None:
+    history = [_ready_result("old", 20.0)]
+    rows = [
+        {**_ready_result("baseline", 10.0), "retest_role": "baseline"},
+        {**_ready_result("incumbent", 20.0), "retest_role": "incumbent"},
+        {**_ready_result("duplicate", 12.0), "retest_role": "challenger"},
+        {
+            **_ready_result("novel", 11.0),
+            "params_fingerprint": "sha256:novel",
+            "retest_role": "challenger",
+        },
+    ]
+    counts = _classify_novelty(rows, history)
+    assert counts == {
+        "novel_configs": 1,
+        "intentional_retests": 2,
+        "accidental_retests": 1,
+    }
+
+
+def test_weaker_challenger_cannot_replace_re_evaluated_incumbent() -> None:
+    incumbent = _ready_result("incumbent", 30.0)
+    challenger = _ready_result("challenger", 25.0)
+    assert _choose_champion_after(incumbent, [challenger]) is incumbent
+
+
+def test_unready_incumbent_cannot_remain_champion_ready() -> None:
+    incumbent = _ready_result("incumbent", 30.0, ready=False)
+    challenger = _ready_result("challenger", 25.0, ready=False)
+    assert _choose_champion_after(incumbent, [challenger]) is None
