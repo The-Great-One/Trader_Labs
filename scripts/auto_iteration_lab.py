@@ -26,6 +26,7 @@ import os
 import random
 import sys
 import time
+from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -77,16 +78,174 @@ BASELINE = {
 }
 
 
-def _load_lab_config() -> dict[str, Any]:
-    """Load the lab's explicit qualification gates and scoring weights."""
+class ConfigError(ValueError):
+    """Strict lab configuration error raised before any market-data access."""
+
+
+@dataclass(frozen=True)
+class ScoreWeightsConfig:
+    worst_year: float
+    median_year: float
+    sharpe: float
+    rolling_12m_min: float
+    drawdown: float
+    annual_mad: float
+    turnover: float
+    outlier_excess: float
+
+
+@dataclass(frozen=True)
+class ConsistencyConfig:
+    min_complete_years: int
+    min_trading_days_per_year: int
+    min_year_return_pct: float
+    min_sharpe_ratio: float
+    min_cost_bps_for_champion: float
+    max_drawdown_abs_pct: float
+    max_year_to_median_ratio: float
+    min_rolling_12m_return_pct: float
+    rolling_year_days: int
+    score_weights: ScoreWeightsConfig
+    disqualification_penalty: float
+
+
+@dataclass(frozen=True)
+class WalkForwardConfig:
+    min_train_years: int
+    test_months: int
+    step_months: int
+    min_test_days: int
+    min_folds: int
+    min_worst_fold_return_pct: float
+    min_stitched_sharpe: float
+    max_stitched_drawdown_abs_pct: float
+    min_baseline_outperformance_ratio: float
+    max_fold_to_median_ratio: float
+
+
+@dataclass(frozen=True)
+class ExecutionConfig:
+    min_execution_open_coverage: float
+    min_held_close_coverage: float
+    max_close_ffill_rows: int
+    allowed_rebalance_frequencies: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class SchemaConfig:
+    result_schema_version: str
+    execution_model: str
+
+
+@dataclass(frozen=True)
+class LabConfig:
+    consistency: ConsistencyConfig
+    walk_forward: WalkForwardConfig
+    execution: ExecutionConfig
+    schema: SchemaConfig
+
+    def __getitem__(self, section: str) -> dict[str, Any]:
+        value = getattr(self, section)
+        return asdict(value)
+
+
+def _strict_keys(section: str, value: Any, expected: set[str]) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise ConfigError(f"{section} must be an object")
+    missing = expected - set(value)
+    unknown = set(value) - expected
+    if missing:
+        raise ConfigError(f"{section} missing keys: {sorted(missing)}")
+    if unknown:
+        raise ConfigError(f"{section} unknown keys: {sorted(unknown)}")
+    return value
+
+
+def _number(section: str, key: str, value: Any, *, integer: bool = False, minimum=None, maximum=None):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ConfigError(f"{section}.{key} must be numeric")
+    numeric = float(value)
+    if not np.isfinite(numeric):
+        raise ConfigError(f"{section}.{key} must be finite")
+    if integer and numeric != int(numeric):
+        raise ConfigError(f"{section}.{key} must be an integer")
+    if minimum is not None and numeric < minimum:
+        raise ConfigError(f"{section}.{key} must be >= {minimum}")
+    if maximum is not None and numeric > maximum:
+        raise ConfigError(f"{section}.{key} must be <= {maximum}")
+    return int(numeric) if integer else numeric
+
+
+def validate_lab_config(payload: Any) -> LabConfig:
+    top = _strict_keys("config", payload, {"consistency", "walk_forward", "execution", "schema"})
+    consistency_keys = {
+        "min_complete_years", "min_trading_days_per_year", "min_year_return_pct",
+        "min_sharpe_ratio", "min_cost_bps_for_champion", "max_drawdown_abs_pct",
+        "max_year_to_median_ratio", "min_rolling_12m_return_pct", "rolling_year_days",
+        "score_weights", "disqualification_penalty",
+    }
+    c = _strict_keys("consistency", top["consistency"], consistency_keys)
+    weight_keys = set(ScoreWeightsConfig.__dataclass_fields__)
+    weights_raw = _strict_keys("consistency.score_weights", c["score_weights"], weight_keys)
+    weights = ScoreWeightsConfig(**{
+        key: _number("consistency.score_weights", key, value, minimum=0)
+        for key, value in weights_raw.items()
+    })
+    consistency = ConsistencyConfig(
+        min_complete_years=_number("consistency", "min_complete_years", c["min_complete_years"], integer=True, minimum=0),
+        min_trading_days_per_year=_number("consistency", "min_trading_days_per_year", c["min_trading_days_per_year"], integer=True, minimum=1),
+        min_year_return_pct=_number("consistency", "min_year_return_pct", c["min_year_return_pct"]),
+        min_sharpe_ratio=_number("consistency", "min_sharpe_ratio", c["min_sharpe_ratio"]),
+        min_cost_bps_for_champion=_number("consistency", "min_cost_bps_for_champion", c["min_cost_bps_for_champion"], minimum=0),
+        max_drawdown_abs_pct=_number("consistency", "max_drawdown_abs_pct", c["max_drawdown_abs_pct"], minimum=0, maximum=100),
+        max_year_to_median_ratio=_number("consistency", "max_year_to_median_ratio", c["max_year_to_median_ratio"], minimum=0),
+        min_rolling_12m_return_pct=_number("consistency", "min_rolling_12m_return_pct", c["min_rolling_12m_return_pct"]),
+        rolling_year_days=_number("consistency", "rolling_year_days", c["rolling_year_days"], integer=True, minimum=2),
+        score_weights=weights,
+        disqualification_penalty=_number("consistency", "disqualification_penalty", c["disqualification_penalty"], minimum=0),
+    )
+    wf_keys = set(WalkForwardConfig.__dataclass_fields__)
+    w = _strict_keys("walk_forward", top["walk_forward"], wf_keys)
+    walk_forward = WalkForwardConfig(
+        min_train_years=_number("walk_forward", "min_train_years", w["min_train_years"], integer=True, minimum=1),
+        test_months=_number("walk_forward", "test_months", w["test_months"], integer=True, minimum=1),
+        step_months=_number("walk_forward", "step_months", w["step_months"], integer=True, minimum=1),
+        min_test_days=_number("walk_forward", "min_test_days", w["min_test_days"], integer=True, minimum=1),
+        min_folds=_number("walk_forward", "min_folds", w["min_folds"], integer=True, minimum=1),
+        min_worst_fold_return_pct=_number("walk_forward", "min_worst_fold_return_pct", w["min_worst_fold_return_pct"]),
+        min_stitched_sharpe=_number("walk_forward", "min_stitched_sharpe", w["min_stitched_sharpe"]),
+        max_stitched_drawdown_abs_pct=_number("walk_forward", "max_stitched_drawdown_abs_pct", w["max_stitched_drawdown_abs_pct"], minimum=0, maximum=100),
+        min_baseline_outperformance_ratio=_number("walk_forward", "min_baseline_outperformance_ratio", w["min_baseline_outperformance_ratio"], minimum=0, maximum=1),
+        max_fold_to_median_ratio=_number("walk_forward", "max_fold_to_median_ratio", w["max_fold_to_median_ratio"], minimum=0),
+    )
+    if walk_forward.step_months < walk_forward.test_months:
+        raise ConfigError("walk_forward.step_months must be >= test_months to prevent overlapping folds")
+    e = _strict_keys("execution", top["execution"], set(ExecutionConfig.__dataclass_fields__))
+    frequencies = e["allowed_rebalance_frequencies"]
+    allowed = {"W-FRI", "2W-FRI", "3W-FRI", "ME"}
+    if not isinstance(frequencies, list) or not frequencies or any(item not in allowed for item in frequencies):
+        raise ConfigError("execution.allowed_rebalance_frequencies contains an invalid rebalance enum")
+    execution = ExecutionConfig(
+        min_execution_open_coverage=_number("execution", "min_execution_open_coverage", e["min_execution_open_coverage"], minimum=0, maximum=1),
+        min_held_close_coverage=_number("execution", "min_held_close_coverage", e["min_held_close_coverage"], minimum=0, maximum=1),
+        max_close_ffill_rows=_number("execution", "max_close_ffill_rows", e["max_close_ffill_rows"], integer=True, minimum=0),
+        allowed_rebalance_frequencies=tuple(frequencies),
+    )
+    schema_raw = _strict_keys("schema", top["schema"], set(SchemaConfig.__dataclass_fields__))
+    for key, value in schema_raw.items():
+        if not isinstance(value, str) or not value.strip():
+            raise ConfigError(f"schema.{key} must be a non-empty string")
+    schema = SchemaConfig(**schema_raw)
+    return LabConfig(consistency, walk_forward, execution, schema)
+
+
+def _load_lab_config() -> LabConfig:
+    """Load and strictly validate every governance setting before data access."""
     try:
         payload = json.loads(CONFIG.read_text())
     except (OSError, json.JSONDecodeError) as exc:
-        raise RuntimeError(f"Unable to load lab configuration: {CONFIG}") from exc
-    consistency = payload.get("consistency")
-    if not isinstance(consistency, dict):
-        raise RuntimeError(f"Missing consistency configuration in {CONFIG}")
-    return payload
+        raise ConfigError(f"Unable to load lab configuration: {CONFIG}") from exc
+    return validate_lab_config(payload)
 
 
 def _consistency_metrics(
@@ -661,6 +820,7 @@ def main():
     t0 = time.time()
     lab_config = _load_lab_config()
     consistency_config = lab_config["consistency"]
+    execution_config = lab_config["execution"]
     print(f"[{datetime.now().strftime('%H:%M:%S')}] Loading data...")
     instruments = _load_instruments()
 
@@ -696,7 +856,17 @@ def main():
         if (idx + 1) % 10 == 0 or idx == 0:
             print(f"  [{idx + 1}/{len(combos)}] {enh} ({time.time()-t0:.0f}s)")
 
-        agg = _simulate(prices, params, instruments, consistency_config)
+        if params.get("rebalance_freq") not in execution_config["allowed_rebalance_frequencies"]:
+            raise ConfigError(
+                f"strategy rebalance_freq {params.get('rebalance_freq')!r} is not allowed"
+            )
+        agg = _simulate(
+            prices,
+            params,
+            instruments,
+            consistency_config,
+            execution_config=execution_config,
+        )
         if agg is None:
             continue
 

@@ -32,5 +32,15 @@
     "max_stitched_drawdown_abs_pct": 35.0,
     "min_baseline_outperformance_ratio": 0.5,
     "max_fold_to_median_ratio": 3.0
+  },
+  "execution": {
+    "min_execution_open_coverage": 0.8,
+    "min_held_close_coverage": 1.0,
+    "max_close_ffill_rows": 3,
+    "allowed_rebalance_frequencies": ["W-FRI", "2W-FRI", "3W-FRI", "ME"]
+  },
+  "schema": {
+    "result_schema_version": "nightly_lab_v6_next_open_stateful",
+    "execution_model": "signal_close_D_fill_open_D_plus_1"
   }
 }
