@@ -812,7 +812,14 @@ def _write_history(path: Path, rows: list[dict[str, Any]]) -> None:
         serialized.append(json.dumps(row, sort_keys=True, allow_nan=False, default=str))
     if len(run_ids) > 1 or (rows and None in run_ids):
         raise HistoryFormatError("history batch must carry one non-empty run_id")
-    atomic_write_text(path, "\n".join(serialized) + ("\n" if serialized else ""))
+    existing = _read_history_path(path) if path.exists() else []
+    existing_serialized = [
+        json.dumps(row, sort_keys=True, allow_nan=False, default=str) for row in existing
+    ]
+    atomic_write_text(
+        path,
+        "\n".join([*existing_serialized, *serialized]) + ("\n" if existing_serialized or serialized else ""),
+    )
 
 
 def _archive_legacy_history(path: Path, archive_dir: Path, timestamp: str) -> Path | None:
@@ -1035,7 +1042,7 @@ def main():
         reverse=True,
     )
 
-    _write_history(HISTORY, [*history, *results])
+    _write_history(HISTORY, results)
 
     # Print results
     base_cagr = baseline_result["agg"]["cagr_pct"] if baseline_result else 0

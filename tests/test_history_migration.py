@@ -49,3 +49,11 @@ def test_history_write_requires_current_schema_and_matching_run_id(tmp_path: Pat
         _write_history(history, [{"schema_version": "legacy", "run_id": "run-1"}])
     _write_history(history, [_row("same"), _row("same")])
     assert {row["run_id"] for row in _read_history_path(history)} == {"same"}
+
+
+def test_history_write_appends_new_run_batch_to_existing_rows(tmp_path: Path) -> None:
+    history = tmp_path / "auto_iteration_history.jsonl"
+    _write_history(history, [_row("run-1")])
+    _write_history(history, [_row("run-2")])
+    rows = _read_history_path(history)
+    assert [row["run_id"] for row in rows] == ["run-1", "run-2"]
