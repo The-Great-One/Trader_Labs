@@ -53,6 +53,7 @@ from scripts.portfolio_simulator import (  # noqa: E402
     SignalIntent,
 )
 from scripts.walk_forward import evaluate_walk_forward  # noqa: E402
+from scripts.atomic_io import atomic_write_json, atomic_write_text  # noqa: E402
 from scripts.lab_schema import (  # noqa: E402
     RESULT_SCHEMA_VERSION,
     STRATEGY_DEFAULTS,
@@ -75,6 +76,10 @@ BASELINE = canonical_params(STRATEGY_DEFAULTS)
 
 class ConfigError(ValueError):
     """Strict lab configuration error raised before any market-data access."""
+
+
+class HistoryFormatError(ValueError):
+    """Current-schema history is malformed or inconsistent."""
 
 
 @dataclass(frozen=True)
@@ -723,17 +728,55 @@ def _apply_walk_forward_readiness(
     return result
 
 
-def _read_history():
-    """Read past results to find the champion."""
-    if not HISTORY.exists():
+def _read_history_path(path: Path):
+    """Read current history strictly; malformed rows are never skipped."""
+    if not path.exists():
         return []
     results = []
-    for line in HISTORY.read_text().strip().split("\n"):
-        try:
-            results.append(json.loads(line))
-        except Exception:
+    for line_number, line in enumerate(path.read_text().splitlines(), 1):
+        if not line.strip():
             continue
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise HistoryFormatError(f"malformed history line {line_number}: {exc.msg}") from exc
+        if row.get("schema_version") != RESULT_SCHEMA_VERSION:
+            raise HistoryFormatError(f"history line {line_number} has non-current schema")
+        results.append(row)
     return results
+
+
+def _read_history():
+    return _read_history_path(HISTORY)
+
+
+def _write_history(path: Path, rows: list[dict[str, Any]]) -> None:
+    run_ids = set()
+    serialized = []
+    for line_number, row in enumerate(rows, 1):
+        if row.get("schema_version") != RESULT_SCHEMA_VERSION:
+            raise HistoryFormatError(f"history line {line_number} has non-current schema")
+        run_ids.add(row.get("run_id"))
+        serialized.append(json.dumps(row, sort_keys=True, allow_nan=False, default=str))
+    if len(run_ids) > 1 or (rows and None in run_ids):
+        raise HistoryFormatError("history batch must carry one non-empty run_id")
+    atomic_write_text(path, "\n".join(serialized) + ("\n" if serialized else ""))
+
+
+def _archive_legacy_history(path: Path, archive_dir: Path, timestamp: str) -> Path | None:
+    if not path.exists():
+        return None
+    first = next((line for line in path.read_text().splitlines() if line.strip()), "")
+    try:
+        current = bool(first) and json.loads(first).get("schema_version") == RESULT_SCHEMA_VERSION
+    except json.JSONDecodeError:
+        current = False
+    if current:
+        return None
+    archive_dir.mkdir(parents=True, exist_ok=True)
+    destination = archive_dir / f"auto_iteration_history.{timestamp}.legacy.jsonl"
+    os.replace(path, destination)
+    return destination
 
 
 def _find_champion(history):
@@ -840,6 +883,9 @@ def _choose_champion_after(incumbent, challengers):
 
 def main():
     t0 = time.time()
+    run_id = os.environ.get("AT_LAB_RUN_ID", "").strip()
+    if not run_id:
+        raise ConfigError("AT_LAB_RUN_ID is required")
     lab_config = _load_lab_config()
     consistency_config = lab_config["consistency"]
     walk_forward_config = lab_config.walk_forward
@@ -860,7 +906,10 @@ def main():
     print(f"Loaded {len(closes.columns)} symbols, {len(closes)} days")
     print(f"Universe: {len(closes.columns)} symbols")
 
-    # Read history and find champion
+    # Archive incompatible evidence once; corrected rows never mix schemas.
+    archived_history = _archive_legacy_history(
+        HISTORY, OUTPUT.parent / "archive", datetime.now().strftime("%Y%m%dT%H%M%S")
+    )
     history = _read_history()
     champion = _find_champion(history)
     if champion:
@@ -908,6 +957,7 @@ def main():
             "agg": agg,
             "is_baseline": is_base,
             "run_date": datetime.now().strftime("%Y-%m-%d"),
+            "run_id": run_id,
         }
         evidence = evaluate_walk_forward(
             prices,
@@ -931,10 +981,7 @@ def main():
         reverse=True,
     )
 
-    # Append to history
-    with open(HISTORY, "a") as f:
-        for r in results:
-            f.write(json.dumps(r, default=str) + "\n")
+    _write_history(HISTORY, [*history, *results])
 
     # Print results
     base_cagr = baseline_result["agg"]["cagr_pct"] if baseline_result else 0
@@ -968,6 +1015,8 @@ def main():
     output = {
         "generated_at": datetime.now().isoformat(),
         "schema_version": RESULT_SCHEMA_VERSION,
+        "run_id": run_id,
+        "legacy_archive": str(archived_history) if archived_history else None,
         "version": "v5.1_consistency_optimised",
         "consistency_config": consistency_config,
         "walk_forward_config": asdict(walk_forward_config),
@@ -982,7 +1031,7 @@ def main():
         "champion_after": new_champ["enhancement"] if new_champ else "none",
         "results": results,
     }
-    OUTPUT.write_text(json.dumps(output, indent=2, default=str))
+    atomic_write_json(OUTPUT, output)
     print(f"\nWrote {len(results)} results to {OUTPUT} ({time.time()-t0:.0f}s)")
     print(f"History: {len(history)} -> {len(history) + len(results)} entries in {HISTORY}")
     return 0
