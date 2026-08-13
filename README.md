@@ -1,116 +1,77 @@
 # Trader_Labs
 
-Research and validation workspace for Auto_Trader.
+Trader_Labs is the focused research deployment for two live, observe-only lab chains:
 
-This repository contains lab-only strategy research, walk-forward validation,
-Kronos experiments, Qlib-style alpha/ranking experiments, option research,
-OOS/CAGR hunts, and Telegram/channel learning analysis. The live Auto_Trader repo
-remains focused on runtime, execution, paper shadowing, dashboards, and
-operational reports.
+1. nightly RSI-momentum auto-iteration; and
+2. the weekday Qlib relative-strength tracker.
 
-## Relationship to Auto_Trader
+It does not place live orders. Strategy promotion still requires reviewed evidence and a separate Auto_Trader change.
 
-- Default sibling live repo: `../Stocks`
-- Override with: `AUTOTRADER_ROOT=/path/to/Auto_Trader`
-- Lab scripts import live rule/runtime modules from Auto_Trader for parity, but
-  lab changes are developed here first.
-- Improvements are promoted back to Auto_Trader only after validation.
+## Live script closure
 
-## First-time local setup
+```text
+scripts/auto_iteration_lab.py
+└── scripts/rsi_224466_rotation_lab.py
 
-```bash
-./scripts/setup_local_links.sh
-python -m venv venv
-source venv/bin/activate
-pip install -r ../Stocks/requirements.txt
-pip install -r requirements-research.txt
-pip install -r requirements-kronos.txt  # optional, for Kronos
+scripts/qlib_rs_daily_tracker.py
+└── scripts/qlib_paper_overlay.py
+    └── scripts/qlib_alpha_lab.py
+        (tracker also imports Auto_Trader.RULE_SET_2, RULE_SET_7, and utils)
 ```
 
-## Qlib-style alpha lab
+`scripts/__init__.py` makes the directory importable. `scripts/run_auto_iteration_nightly.sh` supplies the `start`, `status`, and `stop` lifecycle for the nightly lab.
 
-Run a research-only Microsoft Qlib-style ranking experiment on Kite OHLCV cache:
+## Nightly auto-iteration
 
-```bash
-python scripts/qlib_alpha_lab.py --model lightgbm --top-n 10,20,30 --rebalance W-FRI,ME
+The Hermes nightly chain is:
+
+```text
+Hermes cron 7af4ce25de03
+→ run_auto_iteration.sh
+→ scripts/run_auto_iteration_nightly.sh start
+→ scripts/auto_iteration_lab.py
 ```
 
-The lab uses point-in-time features, embargoed walk-forward scoring, and a
-transaction-cost-adjusted top-N rotation backtest. It writes
-`reports/qlib_alpha_lab_latest.json` and never edits live Auto_Trader rules.
+The live baseline in `auto_iteration_lab.py` is RSI 22/44/66, momentum 63, `3W-FRI`, top 8, SMA100 regime, MACD, momentum-rank blend 0.3, and inverse-volatility weighting with a 10-day lookback. Keep it synchronized with the deployed Auto_Trader paper-shadow parameters.
 
-Run the latest paper-only overlay signal report with:
+Qualification gates and scoring weights are read from `config/auto_iteration_lab.json`. The lab writes:
 
-```bash
-python scripts/qlib_paper_overlay.py --model sklearn_hgb --top-n 10
-```
+- `reports/auto_iteration_latest.json`
+- `reports/auto_iteration_history.jsonl`
+- `reports/auto_iteration_runs/`
 
-It writes `reports/qlib_paper_overlay_latest.json`, marks the decision as
-`OBSERVE_ONLY`, and explicitly sets `production_action=NO_LIVE_TRADES`.
+The history is append-only. Only candidates that pass the configured consistency gates can become the research champion; a research champion is not an automatic live promotion.
 
-Track Qlib picks against live-rule parity diagnostics with:
+Lifecycle commands on the runtime server:
 
 ```bash
-python scripts/qlib_rs_daily_tracker.py --top-n 10
+cd /home/ubuntu/Trader_Labs
+scripts/run_auto_iteration_nightly.sh start
+scripts/run_auto_iteration_nightly.sh status
+scripts/run_auto_iteration_nightly.sh stop
 ```
 
-This writes `reports/qlib_rs_daily_tracker_latest.json` and appends to
-`reports/qlib_rs_daily_tracker_history.jsonl`. It evaluates RS7 entry readiness
-and RS2 exit-if-held status for each Qlib pick, but still places no orders.
-Native `pyqlib` is optional in `requirements-research.txt`; this bridge is kept
-lightweight with sklearn/lightgbm fallbacks so it can run on the research hosts
-before any heavier dependency is promoted.
+Do not start the nightly lab during routine verification.
 
-## US fundamentals + news recommender
+## Qlib tracker
 
-Run a research-only US-market recommender for Tickertape-style US investing:
+The server cron runs `scripts/qlib_rs_daily_tracker.py` at `12:15 UTC`, Monday-Friday. It produces an observe-only Qlib ranking and evaluates each pick against Auto_Trader RS7 entry readiness and RS2 exit-if-held diagnostics. It writes:
+
+- `reports/qlib_rs_daily_tracker_latest.json`
+- `reports/qlib_rs_daily_tracker_history.jsonl`
+
+Example manual invocation:
 
 ```bash
-python scripts/us_fundamental_news_recommender.py
+AUTOTRADER_ROOT=/home/ubuntu/Auto_Trader \
+  /home/ubuntu/Auto_Trader/venv/bin/python scripts/qlib_rs_daily_tracker.py --top-n 10
 ```
 
-Universe: `data/us_markets/tickertape_us_universe.csv`.
-Output: `reports/us_fundamental_news_recommender_latest.json` and `.md`.
-The engine scores only fundamentals, ETF structure metrics, and recent news tone;
-it intentionally excludes technical indicators, price momentum, and live orders.
+## Runtime and promotion boundary
 
-## Promotion rule
-
-Do not edit live trading rules directly from labs. Promotion requires:
-
-1. Kite-cache-only backtest or paper evidence.
-2. Walk-forward/OOS validation.
-3. A short promotion note under `promotion_notes/`.
-4. A small, reviewed patch/PR/cherry-pick into Auto_Trader.
-
-See `PROMOTION.md`.
-
-## Lab-only Kite data refresh
-
-Trader_Labs can refresh Kite auth/history without using the live Auto_Trader
-trading service session.
-
-1. Create ignored credentials:
-
-```bash
-cp secrets/kite_lab_secrets.example.py secrets/kite_lab_secrets.py
-# fill API_KEY, API_SECRET, USER_NAME, PASS, TOTP_KEY
-```
-
-2. Generate a lab-only token:
-
-```bash
-python scripts/kite_lab_token.py refresh --browser
-python scripts/kite_lab_token.py check
-```
-
-3. Fetch historical OHLCV into the lab cache:
-
-```bash
-python scripts/kite_lab_fetch_history.py --universe NIFTY200 --interval day --years 5
-# or preview first
-python scripts/kite_lab_fetch_history.py --symbols RELIANCE,TCS,INFY --dry-run
-```
-
-Token and fetched data are written under `intermediary_files/`, which is ignored
-and should remain separate from live trading service state.
+- Runtime host: `ubuntu@144.24.112.62` (`arunnet`)
+- Deployment root: `/home/ubuntu/Trader_Labs`
+- Auto_Trader dependency: `/home/ubuntu/Auto_Trader`
+- Generated `reports/` and market-data caches remain gitignored.
+- Do not edit live trading rules from this repository.
+- Require consistency qualification, walk-forward/OOS review, execution/data-parity checks, and a separate reviewed Auto_Trader patch before promotion.
