@@ -52,7 +52,10 @@ from scripts.portfolio_simulator import (  # noqa: E402
     PortfolioSimulator,
     SignalIntent,
 )
-from scripts.walk_forward import evaluate_walk_forward  # noqa: E402
+from scripts.walk_forward import (
+    WalkForwardConfigError,
+    evaluate_walk_forward,
+)  # noqa: E402
 from scripts.atomic_io import atomic_write_json, atomic_write_text  # noqa: E402
 from scripts.lab_schema import (  # noqa: E402
     RESULT_SCHEMA_VERSION,
@@ -627,6 +630,55 @@ def _execution_failure(exc: ExecutionDataError) -> dict[str, Any]:
     }
 
 
+def _evaluate_walk_forward_safely(
+    prices,
+    *,
+    candidate_params,
+    baseline_params,
+    instruments,
+    walk_forward_config,
+    execution_config,
+    intent_builder,
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    """Run walk-forward evidence; a data-coverage failure disqualifies the
+    candidate but never aborts the nightly run (report stays publishable)."""
+    try:
+        evidence = evaluate_walk_forward(
+            prices,
+            candidate_params=candidate_params,
+            baseline_params=baseline_params,
+            instruments=instruments,
+            config=walk_forward_config,
+            execution_config=execution_config,
+            intent_builder=intent_builder,
+        )
+        return evidence, None
+    except WalkForwardConfigError as exc:
+        cause = exc
+        while cause.__cause__ is not None:
+            cause = cause.__cause__
+        failure = _execution_failure(cause) if isinstance(cause, ExecutionDataError) else {
+            "reason": str(exc),
+            "signal_date": None,
+            "execution_date": None,
+            "valuation_date": None,
+            "missing_symbols": [],
+            "coverage": None,
+            "source_mark_age": {},
+        }
+        import re as _re
+
+        fold_match = _re.search(r"fold (\d+)", str(exc))
+        failure["fold"] = int(fold_match.group(1)) if fold_match else None
+        evidence = {
+            "qualified": False,
+            "failures": [cause.reason if isinstance(cause, ExecutionDataError) else str(exc)],
+            "fold_rows": [],
+            "execution_failure": failure,
+        }
+        return evidence, failure
+
+
 def _simulate(
     prices,
     params,
@@ -959,16 +1011,18 @@ def main():
             "run_date": datetime.now().strftime("%Y-%m-%d"),
             "run_id": run_id,
         }
-        evidence = evaluate_walk_forward(
+        evidence, wf_failure = _evaluate_walk_forward_safely(
             prices,
             candidate_params=strategy_params,
             baseline_params=BASELINE,
             instruments=instruments,
-            config=walk_forward_config,
+            walk_forward_config=walk_forward_config,
             execution_config=lab_config.execution,
             intent_builder=build_signal_intents,
         )
         evaluated = _apply_walk_forward_readiness(result, evidence)
+        if wf_failure is not None:
+            evaluated["walk_forward_failure"] = wf_failure
         if is_base:
             baseline_result = evaluated
         if incumbent_fingerprint and fingerprint == incumbent_fingerprint:
