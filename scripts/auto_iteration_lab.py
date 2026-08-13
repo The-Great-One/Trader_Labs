@@ -1047,7 +1047,18 @@ def main():
     for i, r in enumerate(results[:20], 1):
         a = r["agg"]
         marker = " <- BASELINE" if r.get("is_baseline") else (" <- CHAMPION" if r["enhancement"].startswith("champion_") else "")
-        print(f"{i:<5} {a['cagr_pct']:>8.1f} {a['max_drawdown_pct']:>8.1f} {a['sharpe_ratio']:>7.2f} "
+        cagr = a.get("cagr_pct")
+        if cagr is None:
+            print(f"{i:<5} {'-':>8} {'-':>8} {'-':>7} {'-':>8} {'-':>8} {'-':>8} {str(a.get('qualified')):>5} "
+                  f"{a.get('selection_score', float('-inf')):>9.1f} {r['enhancement'][:49]}{marker}")
+            failures = list(a.get("qualification_failures", []))
+            wf_failure = r.get("walk_forward_failure")
+            if wf_failure:
+                failures.append(f"walk-forward {wf_failure.get('reason')} fold {wf_failure.get('fold')}")
+            if failures:
+                print(f"      rejected: {', '.join(failures)}")
+            continue
+        print(f"{i:<5} {cagr:>8.1f} {a['max_drawdown_pct']:>8.1f} {a['sharpe_ratio']:>7.2f} "
               f"{a['worst_year_return_pct']:>8.1f} {a['median_year_return_pct']:>8.1f} "
               f"{a['min_rolling_12m_return_pct']:>8.1f} {str(a['qualified']):>5} "
               f"{a['selection_score']:>9.1f} {r['enhancement'][:49]}{marker}")
