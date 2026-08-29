@@ -3,7 +3,16 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 RUN_DIR="$ROOT/reports/auto_iteration_runs"
-PYTHON="${AUTOTRADER_PYTHON:-/home/ubuntu/Auto_Trader/venv/bin/python}"
+# Repointed to the recreated server (Aug-27): Trader_Labs carries its own venv
+# now (Auto_Trader was not migrated). Resolve to the repo venv if present, else
+# system python3. Override explicitly with AUTOTRADER_PYTHON if needed.
+if [[ -n "${AUTOTRADER_PYTHON:-}" ]]; then
+  PYTHON="$AUTOTRADER_PYTHON"
+elif [[ -x "$ROOT/venv/bin/python" ]]; then
+  PYTHON="$ROOT/venv/bin/python"
+else
+  PYTHON="$(command -v python3)"
+fi
 LAB="$ROOT/scripts/auto_iteration_lab.py"
 PID_FILE="$RUN_DIR/current.pid"
 LOG_FILE_REF="$RUN_DIR/current.log"
@@ -56,7 +65,7 @@ start_run() {
     run_id="${10}"
     cd "$root"
     set +e
-    AUTOTRADER_ROOT=/home/ubuntu/Auto_Trader \
+    AUTOTRADER_ROOT="$root" \
       AT_RESEARCH_MODE=1 \
       AT_LAB_PRECACHE=0 \
       AT_DISABLE_FILE_LOGGING=1 \
