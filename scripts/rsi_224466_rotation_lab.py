@@ -104,6 +104,7 @@ def load_ohlc_prices(
         "too_short": 0,
         "stale": 0,
         "read_error": 0,
+        "intra_range_gap": 0,
     }
     duplicate_rows_dropped = 0
     summaries: list[dict] = []
@@ -162,9 +163,30 @@ def load_ohlc_prices(
     common_index = opens.index.union(closes.index).sort_values()
     opens = opens.reindex(common_index)
     closes = closes.reindex(common_index)
+
+    # Keep the simulator fail-closed, but remove symbols with data holes inside
+    # an otherwise active session range before they can become targets. A
+    # missing row on an exchange holiday is harmless when the whole universe is
+    # absent; a missing row for one symbol on an active date is not a valid
+    # next-open price and would otherwise disqualify the entire candidate.
+    active_dates = opens.notna().mean(axis=1).ge(0.8)
+    gap_symbols: list[str] = []
+    for symbol in list(opens.columns):
+        valid = opens[symbol].notna() & closes[symbol].notna()
+        if not valid.any():
+            continue
+        start, end = common_index[valid].min(), common_index[valid].max()
+        in_span = active_dates & (common_index >= start) & (common_index <= end)
+        if opens.loc[in_span, symbol].isna().any() or closes.loc[in_span, symbol].isna().any():
+            gap_symbols.append(symbol)
+    if gap_symbols:
+        opens = opens.drop(columns=gap_symbols)
+        closes = closes.drop(columns=gap_symbols)
+        skipped["intra_range_gap"] = len(gap_symbols)
+
     context = {
         "hist_dir": str(hist_dir),
-        "symbols_loaded": len(loaded_close),
+        "symbols_loaded": len(opens.columns),
         "skipped": skipped,
         "duplicate_rows_dropped": duplicate_rows_dropped,
         "date_range": [str(common_index.min().date()), str(common_index.max().date())],

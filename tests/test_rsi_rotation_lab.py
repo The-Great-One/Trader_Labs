@@ -56,6 +56,21 @@ def test_load_ohlc_prices_deduplicates_normalized_dates_by_last_observation(tmp_
     assert context["duplicate_rows_dropped"] == 1
 
 
+def test_load_ohlc_prices_drops_symbol_with_active_session_gap(tmp_path):
+    dates = pd.date_range("2024-01-02", periods=3, freq="D")
+    for symbol in ["AAA", "BBB", "CCC", "DDD", "EEE"]:
+        rows = {"date": dates, "open": [10.0, 11.0, 12.0], "close": [10.5, 11.5, 12.5]}
+        if symbol == "AAA":
+            rows = {"date": [dates[0], dates[2]], "open": [10.0, 12.0], "close": [10.5, 12.5]}
+        _write_feather(tmp_path / f"{symbol.lower()}.feather", rows)
+
+    ohlc, context = load_ohlc_prices(tmp_path, min_rows=2, min_end_date="", symbols=None, max_symbols=0)
+
+    assert "AAA" not in ohlc["open"].columns
+    assert set(ohlc["open"].columns) == {"BBB", "CCC", "DDD", "EEE"}
+    assert context["skipped"]["intra_range_gap"] == 1
+
+
 def test_load_ohlc_prices_never_synthesizes_open_from_close(tmp_path):
     _write_feather(
         tmp_path / "aaa.feather",
