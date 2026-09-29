@@ -26,7 +26,7 @@ Hermes cron 7af4ce25de03
 - `scripts/walk_forward.py` evaluates fixed candidates in isolated, non-overlapping retrospective folds.
 - `scripts/rsi_224466_rotation_lab.py` supplies the RSI-rotation data loader and backtest primitives shared with the deployed Auto_Trader shadow.
 
-Current baseline (must stay in parity with the deployed shadow): RSI 22/44/66, momentum 63, `3W-FRI`, top 8, SMA100 regime, MACD enabled, blend 0.3, inverse-volatility weighting, volatility lookback 10, 10 bps costs, and maximum three names per sector.
+Current baseline (must stay in parity with the deployed shadow): RSI 22/44/66, momentum 63, `2W-FRI`, top 8, SMA100 regime, MACD enabled, blend 0.3, inverse-volatility weighting, volatility lookback 10, 10 bps costs, and maximum three names per sector.
 
 Outputs:
 

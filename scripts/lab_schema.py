@@ -14,7 +14,7 @@ STRATEGY_DEFAULTS: dict[str, Any] = {
     "regime_mode": "sma100",
     "use_macd": True,
     "top_n": 8,
-    "rebalance_freq": "3W-FRI",
+    "rebalance_freq": "2W-FRI",
     "cost_bps": 10.0,
     "max_per_sector": 3,
     "blend_weight": 0.3,

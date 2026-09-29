@@ -22,7 +22,7 @@ Hermes cron 7af4ce25de03
 → scripts/auto_iteration_lab.py
 ```
 
-The live baseline in `auto_iteration_lab.py` is RSI 22/44/66, momentum 63, `3W-FRI`, top 8, SMA100 regime, MACD, momentum-rank blend 0.3, and inverse-volatility weighting with a 10-day lookback. Keep it synchronized with the deployed Auto_Trader paper-shadow parameters.
+The live baseline in `auto_iteration_lab.py` is RSI 22/44/66, momentum 63, `2W-FRI`, top 8, SMA100 regime, MACD, momentum-rank blend 0.3, and inverse-volatility weighting with a 10-day lookback. Keep it synchronized with the deployed Auto_Trader paper-shadow parameters.
 
 Qualification gates and scoring weights are read from `config/auto_iteration_lab.json`. The lab writes:
 
