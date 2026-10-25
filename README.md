@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="https://via.placeholder.com/120x120.png?text=TL" alt="Trader_Labs logo" width="120" height="120" />
+<img src="icon.png" alt="Trader_Labs logo" width="120" height="120" />
 
 # Trader_Labs
 
